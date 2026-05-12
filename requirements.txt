@@ -1,0 +1,8 @@
+# EMS – Dépendances Python
+# Aucune dépendance externe requise.
+# L'application utilise uniquement la bibliothèque standard Python.
+#
+# Vérification :
+#   python -c "import tkinter, sqlite3, json, pathlib, datetime; print('Tout OK')"
+#
+# Python >= 3.8 requis.

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Bon d'intervention BON-2026-0002</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Arial, Helvetica, sans-serif; font-size: 10.5px; color: #000;
+       background: #fff; padding: 16px 20px; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #000; padding: 3px 5px; vertical-align: top; }
+
+/* En-tête en 3 colonnes */
+.header { display: grid; grid-template-columns: 170px 1fr 200px; gap: 0;
+           border-bottom: 2px solid #000; padding-bottom: 6px; margin-bottom: 8px; }
+.header-left { display: flex; flex-direction: column; align-items: center;
+                justify-content: center; padding: 4px; }
+.header-left img { max-width: 150px; max-height: 80px; }
+.header-left .logo-fallback { font-size: 28px; font-weight: bold; color: #003366;
+                                letter-spacing: 3px; }
+.header-left .slogan { font-size: 8px; color: #555; font-style: italic;
+                        margin-top: 2px; text-align: center; }
+.header-mid { text-align: center; padding: 4px; }
+.header-mid h1 { font-size: 16px; font-weight: bold; margin-bottom: 4px; }
+.header-mid .info { font-size: 9.5px; line-height: 1.4; }
+.header-right { padding: 4px 8px; }
+.header-right .titre { font-weight: bold; font-size: 11px; margin-bottom: 4px; }
+.type-row { font-size: 10.5px; padding: 1px 0; }
+.type-row .cb { font-family: "Segoe UI Symbol", Arial, sans-serif;
+                 font-size: 13px; margin-right: 4px; }
+
+/* Référence du bon (encadré en haut à gauche) */
+.ref-box { position: absolute; top: 10px; left: 18px;
+            background: #003366; color: #fff; padding: 4px 10px;
+            font-size: 11px; font-weight: bold; border-radius: 4px;
+            z-index: 10; }
+.statut-badge { display: inline-block; padding: 1px 8px; margin-left: 6px;
+                 border-radius: 8px; font-size: 9px; font-weight: bold; }
+.statut-ec   { background: #fff3cd; color: #856404; }
+.statut-clos { background: #d1e7dd; color: #0f5132; }
+.statut-fact { background: #cfe2ff; color: #084298; }
+.urg-badge   { display: inline-block; padding: 1px 8px; margin-left: 4px;
+                 border-radius: 8px; font-size: 9px; font-weight: bold; }
+.urg-norm    { background: #e9ecef; color: #495057; }
+.urg-urg     { background: #ffe5cc; color: #cc4400; }
+.urg-crit    { background: #f8d7da; color: #721c24; }
+.classif { font-size: 9.5px; margin-top: 4px; }
+.classif .cb { font-family: "Segoe UI Symbol", Arial, sans-serif; font-size: 12px; }
+.classif .pill { display: inline-block; padding: 1px 6px; margin-right: 4px;
+                   background: #f0f0f0; border-radius: 8px; font-weight: bold; }
+.classif .pill.on { background: #003366; color: #fff; }
+
+/* Bloc info client/équipement (2 colonnes) */
+.bloc-info { width: 100%; margin-top: 4px; }
+.bloc-info td { font-size: 10px; height: 18px; }
+.bloc-info .lbl { background: #f5f5f5; font-weight: bold; width: 28%; }
+
+/* Sections texte */
+.section-title { font-weight: bold; font-size: 11px; text-decoration: underline;
+                  margin: 10px 0 3px; }
+.zone-texte { border: 1px solid #000; min-height: 50px; padding: 4px 6px;
+               white-space: pre-wrap; font-size: 10px; line-height: 1.5; }
+.zone-grande { min-height: 70px; }
+
+/* Ligne d'options (cases à cocher inline) */
+.options { margin: 4px 0; font-size: 10.5px; }
+.options .opt { display: inline-block; margin-right: 16px; }
+.options .cb { font-family: "Segoe UI Symbol", Arial, sans-serif;
+                font-size: 13px; margin-right: 3px; }
+.options strong { font-size: 10.5px; }
+
+/* Tableau matériels */
+.materiels { margin-top: 4px; }
+.materiels th { background: #003366; color: #fff; font-size: 10px;
+                 text-align: left; padding: 4px 6px; }
+.materiels td { height: 22px; font-size: 10px; }
+.materiels .qte { width: 60px; text-align: center; }
+.materiels .ref { width: 130px; }
+
+/* Bloc info / préco à droite des matériels */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+          margin-top: 6px; }
+.info-box { border: 1px solid #000; padding: 4px 6px; min-height: 90px;
+             font-size: 10px; line-height: 1.4; }
+.info-box .head { font-size: 10.5px; margin-bottom: 4px; }
+.info-box .head .opt { display: inline-block; margin-right: 18px; }
+.info-box .body { white-space: pre-wrap; }
+
+/* Tableau déplacements */
+.depl { width: 100%; margin-top: 4px; }
+.depl th { background: #003366; color: #fff; font-size: 10px;
+            padding: 4px 6px; text-align: left; }
+.depl td { height: 18px; font-size: 10px; }
+.depl .lbl { background: #f5f5f5; font-weight: bold; width: 25%; }
+.depl .val { width: 25%; }
+
+/* Signatures */
+.signatures { display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+               margin-top: 16px; }
+.sign-box { border: 1px solid #000; padding: 6px; min-height: 70px;
+             font-size: 10px; }
+.sign-box .head { font-weight: bold; margin-bottom: 4px; }
+.sign-box .lab  { font-size: 9px; color: #555; margin-top: 30px;
+                   border-top: 1px dotted #999; padding-top: 3px; }
+
+/* Pied de page */
+.footer { border-top: 1px solid #000; margin-top: 14px; padding-top: 6px;
+           font-size: 8.5px; color: #444; text-align: center; line-height: 1.6; }
+.footer strong { color: #003366; }
+
+/* Bouton imprimer */
+.print-btn { position: fixed; top: 10px; right: 10px; background: #003366;
+              color: #fff; border: 0; padding: 8px 16px; border-radius: 5px;
+              font-size: 11px; cursor: pointer; font-family: Arial; }
+@media print {
+  .print-btn { display: none; }
+  body { padding: 8mm; }
+  .ref-box { position: static; float: left; margin-bottom: 4px; }
+}
+</style>
+</head>
+<body>
+<button class="print-btn" onclick="window.print()">🖨 Imprimer / PDF</button>
+
+<div class="ref-box">BON-2026-0002
+  <span class="statut-badge statut-ec">En cours</span>
+  <span class="urg-badge urg-norm">⚡ Normale</span>
+</div>
+
+<!-- ═══ EN-TÊTE ═══ -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo-fallback">EMS</div>
+    <div class="slogan">L'application motorisée,<br>au cœur de vos énergies</div>
+  </div>
+  <div class="header-mid">
+    <h1>BON D'INTERVENTION</h1>
+    <div class="info">
+      9bis avenue Louis Martin – 35400 Saint Malo<br>
+      Tél : 02.99.19.01.99 &nbsp;–&nbsp; Fax : 02.99.81.11.75<br>
+      Courriel : service.technique@emeraudemoteurs.com<br>
+      Siret 431 976 729 00027 &nbsp;|&nbsp; TVA intra FR 14 431 976 729
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="titre">Type d'intervention :</div>
+    <div class="type-row"><span class="cb">☐</span> Entretien</div>
+<div class="type-row"><span class="cb">☐</span> Dépannage</div>
+<div class="type-row"><span class="cb">☐</span> Diagnostic</div>
+<div class="type-row"><span class="cb">☐</span> Garantie</div>
+
+    <div class="type-row"><span class="cb">☒</span> Garantie Scania</div>
+  </div>
+</div>
+
+<!-- ═══ BLOC CLIENT / ÉQUIPEMENT (2 COLONNES) ═══ -->
+<table class="bloc-info">
+  <tr>
+    <td class="lbl">Informations société<br>Signature</td>
+    <td>Client test<br><small></small></td>
+    <td class="lbl">Nom bateau / type machine</td>
+    <td>test</td>
+  </tr>
+  <tr>
+    <td class="lbl">Lieu de l'intervention</td>
+    <td>Miniac Pirate</td>
+    <td class="lbl">Type moteur / inverseur</td>
+    <td>test</td>
+  </tr>
+  <tr>
+    <td class="lbl">Nom du signataire</td>
+    <td>Marie feur</td>
+    <td class="lbl">N° de série</td>
+    <td><strong>0000000000000</strong></td>
+  </tr>
+  <tr>
+    <td class="lbl">Courriel du signataire</td>
+    <td>marie@feur.com</td>
+    <td class="lbl">Nb heures de fonctionnement</td>
+    <td>10000</td>
+  </tr>
+  <tr>
+    <td class="lbl">Téléphone</td>
+    <td>0600000000</td>
+    <td class="lbl">Date de mise en service</td>
+    <td>10/01/2025</td>
+  </tr>
+  <tr>
+    <td class="lbl">Date de l'intervention</td>
+    <td>06/05/2026</td>
+    <td class="lbl">Garantie</td>
+    <td>12 mois</td>
+  </tr>
+  <tr>
+    <td class="lbl">Technicien EMS</td>
+    <td colspan="3"><strong>Test</strong></td>
+  </tr>
+</table>
+
+<!-- Classifications -->
+<div class="classif">
+  <span class="pill ">☐ Garantie</span>
+  <span class="pill ">☐ Facturable</span>
+  <span class="pill ">☐ Interne</span>
+</div>
+
+<!-- ═══ DEMANDE DU CLIENT ═══ -->
+<div class="section-title">DEMANDE DU CLIENT :</div>
+<div class="zone-texte">Réparer tel ou tel truc</div>
+
+<!-- ═══ OPTIONS / DIAGNOSTIC ═══ -->
+<div class="options">
+  <span class="opt"><span class="cb">☒</span> Utilisation de l'Outil de diagnostic</span>
+  <span class="opt"><strong>Mémoriser les données :</strong>
+    <span class="cb">☒</span> avant
+    <span class="cb">☒</span> après</span>
+  <span class="opt"><strong>PHOTOS :</strong>
+    <span class="cb">☒</span> avant
+    <span class="cb">☒</span> après</span>
+</div>
+
+<!-- ═══ CONSTAT AVANT INTERVENTION ═══ -->
+<div class="section-title">CONSTAT AVANT INTERVENTION :</div>
+<div class="zone-texte zone-grande">tout est cassé</div>
+
+<!-- ═══ TRAVAUX ═══ -->
+<div class="section-title">TRAVAUX :</div>
+<div class="zone-texte zone-grande">on a tout réparer c'est fou wow</div>
+
+<!-- ═══ MATÉRIELS UTILISÉS + INFORMATIONS ═══ -->
+<div class="section-title">MATÉRIELS UTILISÉS</div>
+<div class="split">
+  <table class="materiels">
+    <thead>
+      <tr>
+        <th class="qte">QUANTITÉ</th>
+        <th class="ref">RÉFÉRENCE</th>
+        <th>DÉSIGNATION</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>20</td><td>WC454ab</td><td>feur</td></tr>
+      <tr><td>10</td><td>supremfeur</td><td>sauce samourai</td></tr>
+      <tr><td>1</td><td>1</td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+      <tr><td>1</td><td></td><td>a</td></tr>
+    </tbody>
+  </table>
+  <div class="info-box">
+    <div class="head">
+      <span class="opt"><span class="cb" style="font-family:'Segoe UI Symbol',Arial;font-size:13px;">☐</span> Pour information</span>
+      <span class="opt"><span class="cb" style="font-family:'Segoe UI Symbol',Arial;font-size:13px;">☒</span> Préconisation</span>
+    </div>
+    <div class="body">préconiser tungtungtung</div>
+  </div>
+</div>
+
+<!-- ═══ DÉPLACEMENTS ═══ -->
+<div class="section-title">DÉPLACEMENTS</div>
+<table class="depl">
+  <tr>
+    <td class="lbl">Temps de trajet aller</td>      <td class="val">20h</td>
+    <td class="lbl">Frais de repas</td>             <td class="val">20</td>
+  </tr>
+  <tr>
+    <td class="lbl">Heure début intervention matin</td>      <td class="val">8h</td>
+    <td class="lbl">Frais d'hôtel</td>                       <td class="val">20</td>
+  </tr>
+  <tr>
+    <td class="lbl">Heure fin intervention matin</td>        <td class="val"></td>
+    <td class="lbl">Frais de péages</td>                     <td class="val">20</td>
+  </tr>
+  <tr>
+    <td class="lbl">Heure début intervention après-midi</td> <td class="val"></td>
+    <td class="lbl">Temps de préparation avant intervention</td> <td class="val"></td>
+  </tr>
+  <tr>
+    <td class="lbl">Heure fin intervention après-midi</td>   <td class="val"></td>
+    <td class="lbl">Temps de rangement après intervention</td>   <td class="val"></td>
+  </tr>
+  <tr>
+    <td class="lbl">Temps de trajet retour</td>     <td class="val"></td>
+    <td class="lbl"></td>                            <td class="val"></td>
+  </tr>
+</table>
+
+<!-- ═══ SIGNATURES ═══ -->
+<div class="signatures">
+  <div class="sign-box">
+    <div class="head">Signature Client (Nom &amp; date) :</div>
+    <div class="lab">Bon pour accord des travaux réalisés</div>
+  </div>
+  <div class="sign-box">
+    <div class="head">Signature Technicien EMS :</div>
+    <div class="lab">Test</div>
+  </div>
+</div>
+
+<!-- ═══ PIED DE PAGE ═══ -->
+<div class="footer">
+  <strong>Emeraude Moteurs Systèmes</strong> – Constructeur de groupe de puissance<br>
+  9bis avenue Louis Martin – 35400 Saint Malo &nbsp;|&nbsp;
+  9 Rue d'Armorique – 35540 Miniac Morvan<br>
+  Tél : 02.99.19.01.99 &nbsp;|&nbsp; Fax : 02.99.81.11.75 &nbsp;|&nbsp;
+  <strong>www.emeraudemoteurs.com</strong><br>
+  <em style="color:#888;">Document généré le 11/05/2026 à 13:50</em>
+</div>
+</body>
+</html>

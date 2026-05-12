@@ -1,0 +1,2 @@
+Ce dossier contiendra un sous-dossier par bon d'intervention (BON-AAAA-XXXX).
+Chaque sous-dossier inclut le bon HTML et peut recevoir photos, factures, documents.
