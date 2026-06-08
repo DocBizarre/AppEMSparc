@@ -1,3 +1,0 @@
-Ce dossier contiendra la base de données SQLite (ems.db) créée au premier lancement.
-
-Sauvegardez régulièrement ce fichier pour protéger vos données.
