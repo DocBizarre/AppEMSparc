@@ -14,21 +14,12 @@ from pathlib import Path
 from ems_client import api as db
 from shared import mailer
 from shared import csv_importer
-from shared.bon_generator import sauvegarder_bon, ouvrir_fichier
+from shared.bon_generator import sauvegarder_bon, ouvrir_fichier, apply_icon
 
 
 def _check_api_startup():
-    """Affiche un avertissement si le serveur est injoignable au démarrage."""
-    ok, msg = db.check_api()
-    if not ok:
-        import tkinter as _tk
-        from tkinter import messagebox as _mb
-        _r = _tk.Tk(); _r.withdraw()
-        if not _mb.askokcancel(
-            "Serveur introuvable",
-            f"{msg}\n\nVérifiez que le serveur EMS est démarré.\n\n"
-            "Continuer quand même ?"):
-            raise SystemExit(0)
+    """Vérifie la connectivité sans bloquer l'ouverture de l'app."""
+    pass  # Le statut est affiché dans la bannière de la sidebar
 
 
 _check_api_startup()
@@ -764,11 +755,12 @@ class TechniciensPicker(tk.Frame):
       .get() / .set(str) → version compat (chaîne CSV)
       .set_available(list) → met à jour la liste des techniciens disponibles
     """
-    def __init__(self, master, available=None, on_add_new=None, **kw):
+    def __init__(self, master, available=None, on_add_new=None, on_change=None, **kw):
         super().__init__(master, bg=master.cget("bg") if "bg" not in kw else kw.get("bg"))
         self._available = list(available or [])
         self._selected  = []
         self._on_add_new = on_add_new  # callback : ouvre TechnicienDialog
+        self._on_change_cb = on_change  # callback(names) quand la sélection change
 
         # Ligne 1 : combobox + boutons
         row1 = tk.Frame(self, bg=self.cget("bg"))
@@ -874,6 +866,7 @@ class TechniciensPicker(tk.Frame):
         self._selected.append(resolved)
         self._combo_var.set("")
         self._render_chips()
+        self._fire_change()
 
     def _on_add_new_clicked(self):
         # Délègue à la fonction passée (qui ouvre TechnicienDialog
@@ -889,11 +882,17 @@ class TechniciensPicker(tk.Frame):
         if new_name and new_name not in self._selected and new_name in self._available:
             self._selected.append(new_name)
             self._render_chips()
+            self._fire_change()
 
     def _remove(self, name):
         if name in self._selected:
             self._selected.remove(name)
             self._render_chips()
+            self._fire_change()
+
+    def _fire_change(self):
+        if self._on_change_cb is not None:
+            self._on_change_cb(list(self._selected))
 
     def _render_chips(self):
         for w in self._chips_frame.winfo_children():
@@ -926,10 +925,10 @@ class TechniciensPicker(tk.Frame):
 class AppEMS(tk.Tk):
     # Onglets visibles selon le mode de l'application
     NAV_PARELEMENTS = {
-        "bons": ["dashboard", "interventions", "nouveau"],
+        "bons": ["dashboard", "interventions", "import_export", "nouveau"],
         "parc": ["clients", "moteurs", "techniciens"],
         "full": ["dashboard", "interventions", "clients",
-                 "moteurs", "techniciens", "nouveau"],
+                 "moteurs", "techniciens", "import_export", "nouveau"],
     }
     TITRES = {
         "bons": "EMS – Bons d'intervention",
@@ -939,6 +938,8 @@ class AppEMS(tk.Tk):
 
     def __init__(self, mode="full"):
         super().__init__()
+        self.withdraw()
+        apply_icon(self)
         self.mode = mode if mode in self.NAV_PARELEMENTS else "full"
         self._onglets_actifs = self.NAV_PARELEMENTS[self.mode]
         self.title(self.TITRES[self.mode])
@@ -948,7 +949,16 @@ class AppEMS(tk.Tk):
         self._init_ttk_styles()
         db.init_db()
         self._build()
-        self.show(self._onglets_actifs[0])
+        self.update_idletasks()
+        self.deiconify()
+        # Différer le premier refresh : la fenêtre s'affiche avant tout appel API
+        self.after(50, self._initial_show)
+
+    def _initial_show(self):
+        try:
+            self.show(self._onglets_actifs[0])
+        except Exception:
+            pass
 
     def _init_ttk_styles(self):
         """Configure les styles ttk : Treeview, Combobox, Entry, Notebook."""
@@ -1157,6 +1167,7 @@ class AppEMS(tk.Tk):
             ("clients",       "👥", "Clients"),
             ("moteurs",       "⚙",  "Moteurs"),
             ("techniciens",   "🔨", "Techniciens"),
+            ("import_export", "🔄", "Import / Export"),
             ("nouveau",       "➕", "Nouveau bon"),
         ]:
             if key not in self._onglets_actifs:
@@ -1217,7 +1228,13 @@ class AppEMS(tk.Tk):
 
         # Version en bas
         tk.Label(self.sidebar, text="v1.8 · Heure de Paris", font=F["tiny"],
-                 bg=C["header"], fg="#6699cc").pack(side="bottom", pady=10)
+                 bg=C["header"], fg="#6699cc").pack(side="bottom", pady=(0, 8))
+
+        # Indicateur de connexion
+        self._conn_lbl = tk.Label(self.sidebar, text="● Vérification…",
+                                   font=F["tiny"], bg=C["header"], fg="#6699cc")
+        self._conn_lbl.pack(side="bottom", pady=(4, 0))
+        self.after(500, self._update_conn)
 
         # Zone principale
         self.main = tk.Frame(self, bg=C["bg"])
@@ -1225,12 +1242,13 @@ class AppEMS(tk.Tk):
 
         self.frames = {}
         for FrameCls, key in [
-            (DashboardFrame,     "dashboard"),
-            (InterventionsFrame, "interventions"),
-            (ClientsFrame,       "clients"),
-            (MoteursFrame,       "moteurs"),
-            (TechniciensFrame,   "techniciens"),
-            (NouveauFrame,       "nouveau"),
+            (DashboardFrame,      "dashboard"),
+            (InterventionsFrame,  "interventions"),
+            (ClientsFrame,        "clients"),
+            (MoteursFrame,        "moteurs"),
+            (TechniciensFrame,    "techniciens"),
+            (ImportExportFrame,   "import_export"),
+            (NouveauFrame,        "nouveau"),
         ]:
             if key not in self._onglets_actifs:
                 continue
@@ -1260,6 +1278,20 @@ class AppEMS(tk.Tk):
             self.show(key)
             return True
         return False
+
+    def _update_conn(self):
+        """Met à jour l'indicateur de connexion en thread de fond (toutes les 20 s)."""
+        import threading
+        def _bg():
+            en_ligne = db.ping(timeout=2.0)
+            try:
+                self.after(0, lambda: self._conn_lbl.config(
+                    text="● En ligne" if en_ligne else "○ Hors ligne",
+                    fg="#6fd46f" if en_ligne else "#f0a0a0"))
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
+        self.after(20000, self._update_conn)
 
     def refresh_frame(self, key):
         """Rafraîchit un onglet s'il existe (sécurisé multi-mode)."""
@@ -1814,12 +1846,24 @@ class DashboardFrame(tk.Frame):
 
     def _rebuild(self):
         """Reconstruit les widgets selon la config actuelle."""
-        # Détruire tous les widgets actuels
         for w in self.inner.winfo_children():
             w.destroy()
         self._widgets.clear()
-        # Recréer dans l'ordre voulu
-        active = db.get_dashboard_widgets()
+        offline = False
+        try:
+            active = db.get_dashboard_widgets()
+        except Exception:
+            active = []
+            offline = True
+
+        if not active:
+            msg = ("Serveur inaccessible — tableau de bord indisponible hors ligne."
+                   if offline else
+                   "Aucun widget configuré. Cliquez sur ⚙ Configurer.")
+            tk.Label(self.inner, text=msg, bg=C["bg"], fg="#888",
+                     font=("Arial", 11), justify="center").pack(pady=60)
+            return  # évite la récursion refresh() → _rebuild()
+
         for key in active:
             cls = WIDGET_CLASSES.get(key)
             if not cls:
@@ -1829,19 +1873,22 @@ class DashboardFrame(tk.Frame):
             w = cls(wrap, self.app)
             w.pack(fill="x")
             self._widgets[key] = w
-        self.refresh()
+        if self._widgets:
+            self.refresh()
 
     def refresh(self):
-        # Si pas encore construit, construire
         if not self._widgets:
             self._rebuild()
             return
-        # Sinon refresh chaque widget
-        for w in self._widgets.values():
-            try:
-                w.refresh()
-            except Exception as e:
-                print(f"Erreur refresh widget: {e}")
+        import threading
+        widgets = list(self._widgets.values())
+        def _bg():
+            for w in widgets:
+                try:
+                    w.refresh()
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1903,12 +1950,34 @@ class InterventionsFrame(tk.Frame):
         self._cache = []
 
     def refresh(self):
-        invs = db.get_interventions(statut=self.statut_var.get(),
-                                     urgence=self.urgence_var.get(),
-                                     search=self.search_var.get())
-        self._cache = list(invs)
-        rows = []
-        urgs = []
+        import threading
+        statut  = self.statut_var.get()
+        urgence = self.urgence_var.get()
+        search  = self.search_var.get()
+
+        def _bg():
+            try:
+                invs = list(db.get_interventions(statut=statut,
+                                                  urgence=urgence, search=search))
+            except Exception:
+                invs = None
+            try:
+                self.after(0, lambda: self._apply_refresh(invs))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_refresh(self, invs):
+        if invs is None:
+            self.tree.delete(*self.tree.get_children())
+            self.tree.insert("", "end", iid="0",
+                             values=("", "Hors ligne", "", "Serveur inaccessible",
+                                     "", "", "", "", "", ""))
+            self._cache = []
+            return
+        self._cache = invs
+        rows, urgs = [], []
         for r in self._cache:
             rows.append((
                 r["urgence"], r["num_bon"], r["date_creation"], r["client_nom"] or "",
@@ -2014,11 +2083,23 @@ class InterventionsFrame(tk.Frame):
             messagebox.showwarning("Email manquant",
                 "Aucun email renseigné (demandeur, signataire ou client).")
             return
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_client(inv, client, moteur, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_client(inv, client, moteur, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
         db.mark_notifie(r["id"], "client")
         self.refresh()
 
@@ -2036,11 +2117,23 @@ class InterventionsFrame(tk.Frame):
             em = row_get(t, "email")
             if em:
                 emails.append(em)
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_technicien(inv, client, moteur, emails, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_technicien(inv, client, moteur, emails, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
         db.mark_notifie(r["id"], "tech")
         self.refresh()
 
@@ -2062,11 +2155,23 @@ class InterventionsFrame(tk.Frame):
             em = row_get(t, "email")
             if em:
                 tech_emails.append(em)
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_cloture(inv, client, moteur, tech_emails, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_cloture(inv, client, moteur, tech_emails, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
 
     def _supprimer(self):
         r = self._sel()
@@ -2205,8 +2310,51 @@ class MoteursFrame(tk.Frame):
         self.tree.bind("<<TreeviewSelect>>", self._on_select_change)
         self._cache = []
 
+        # ── Panneau sous-ensembles (collapsible) ──────────────────────────
+        self._se_open = False
+        self._se_moteur = None
+        self._se_cache = []
+
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(4, 0))
+
+        se_hdr = tk.Frame(self, bg=C["bg"])
+        se_hdr.pack(fill="x", padx=20)
+        self._se_toggle_btn = tk.Button(
+            se_hdr, text="▶  Sous-ensembles",
+            bg=C["bg"], fg=C["text_muted"],
+            font=F["small"], relief="flat", bd=0,
+            anchor="w", cursor="hand2",
+            command=self._toggle_se_panel,
+        )
+        self._se_toggle_btn.pack(side="left", pady=4)
+        self._se_count_lbl = tk.Label(
+            se_hdr, text="", bg=C["bg"],
+            fg=C["text_muted"], font=F["small"])
+        self._se_count_lbl.pack(side="left", padx=(4, 0))
+
+        self._se_panel = tk.Frame(self, bg=C["bg"])
+        cols_se = ("libelle", "reference", "marque", "num_serie", "etat")
+        col_defs_se = [
+            ("libelle",   "Libellé",   200),
+            ("reference", "Référence", 120),
+            ("marque",    "Marque",     90),
+            ("num_serie", "N° Série",  140),
+            ("etat",      "État",       90),
+        ]
+        se_tf, self._se_tree = mk_tree(self._se_panel, cols_se, col_defs_se, height=5)
+        se_tf.pack(fill="x", padx=0, pady=(4, 0))
+        se_af = tk.Frame(self._se_panel, bg=C["bg"])
+        se_af.pack(fill="x", pady=4)
+        mk_btn(se_af, "➕ Ajouter sous-ensemble", self._se_add).pack(side="left", padx=4)
+        mk_btn(se_af, "✏️ Modifier", self._se_edit,
+               color=C["btn2"]).pack(side="left", padx=4)
+        mk_btn(se_af, "🗑️ Supprimer", self._se_del,
+               color=C["danger"]).pack(side="left", padx=4)
+        self._se_tree.bind("<Double-1>", lambda _: self._se_edit())
+
     def _on_select_change(self, _ev=None):
-        n = len(self.tree.selection())
+        sel = self.tree.selection()
+        n = len(sel)
         if n <= 1:
             self.sel_info.config(text="")
             self.btn_suppr.config(text="🗑️ Supprimer")
@@ -2215,6 +2363,108 @@ class MoteursFrame(tk.Frame):
                 text=f"{n} moteurs sélectionnés "
                      "(Ctrl/Maj-clic pour ajuster)")
             self.btn_suppr.config(text=f"🗑️ Supprimer ({n})")
+        # Mise à jour panneau sous-ensembles
+        if sel:
+            m = self._cache[int(sel[0])]
+            self._se_moteur = m
+            nb = m.get("nb_sous_ensembles", 0)
+            if nb:
+                self._se_count_lbl.config(
+                    text=f"({nb} sous-ensemble{'s' if nb > 1 else ''})",
+                    fg=C["header"])
+                self._se_toggle_btn.config(fg=C["header"])
+            else:
+                self._se_count_lbl.config(text="(aucun)", fg=C["text_muted"])
+                self._se_toggle_btn.config(fg=C["text_muted"])
+            if self._se_open:
+                self._load_se()
+        else:
+            self._se_moteur = None
+            self._se_count_lbl.config(text="", fg=C["text_muted"])
+            self._se_toggle_btn.config(fg=C["text_muted"])
+
+    def _toggle_se_panel(self):
+        if not self._se_moteur:
+            return
+        self._se_open = not self._se_open
+        arrow = "▼" if self._se_open else "▶"
+        self._se_toggle_btn.config(text=f"{arrow}  Sous-ensembles")
+        if self._se_open:
+            self._se_panel.pack(fill="x", padx=20, pady=(0, 8))
+            self._load_se()
+        else:
+            self._se_panel.pack_forget()
+
+    def _load_se(self):
+        if not self._se_moteur:
+            return
+        try:
+            self._se_cache = list(db.get_sous_ensembles(self._se_moteur["id"]))
+        except Exception as e:
+            self._se_cache = []
+            print(f"[MoteursFrame] sous-ensembles : {e}")
+        self._se_tree.delete(*self._se_tree.get_children())
+        if not self._se_cache:
+            self._se_tree.insert("", "end",
+                                 values=("(aucun sous-ensemble)", "", "", "", ""))
+        else:
+            for i, se in enumerate(self._se_cache):
+                tags = ("even" if i % 2 == 0 else "odd",)
+                self._se_tree.insert("", "end", iid=str(i),
+                    values=(se.get("libelle", ""),
+                            se.get("reference", ""),
+                            se.get("marque", ""),
+                            se.get("num_serie", ""),
+                            se.get("etat", "")),
+                    tags=tags)
+        # Mettre à jour le compteur
+        nb = len(self._se_cache)
+        if nb:
+            self._se_count_lbl.config(
+                text=f"({nb} sous-ensemble{'s' if nb > 1 else ''})",
+                fg=C["header"])
+        else:
+            self._se_count_lbl.config(text="(aucun)", fg=C["text_muted"])
+
+    def _se_add(self):
+        if not self._se_moteur:
+            messagebox.showwarning("Sélection", "Sélectionnez un moteur d'abord.")
+            return
+        def _after_save():
+            self._load_se()
+            self.refresh()
+        SousEnsembleDialog(self, self.app, dict(self._se_moteur), on_save=_after_save)
+
+    def _se_edit(self):
+        sel = self._se_tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.")
+            return
+        idx = int(sel[0])
+        if idx >= len(self._se_cache):
+            return
+        SousEnsembleDialog(self, self.app, dict(self._se_moteur),
+                           se=dict(self._se_cache[idx]),
+                           on_save=self._load_se)
+
+    def _se_del(self):
+        sel = self._se_tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.")
+            return
+        idx = int(sel[0])
+        if idx >= len(self._se_cache):
+            return
+        se = self._se_cache[idx]
+        if not messagebox.askyesno("Supprimer",
+                f"Supprimer le sous-ensemble « {se.get('libelle', '')} » ?"):
+            return
+        try:
+            db.delete_sous_ensemble(self._se_moteur["id"], se["id"])
+            self._load_se()
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e))
 
     def refresh(self):
         ms = db.get_moteurs(search=self.search_var.get(),
@@ -3133,6 +3383,327 @@ class NouveauFrame(tk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IMPORT / EXPORT — transfert de bons hors connexion
+# ══════════════════════════════════════════════════════════════════════════════
+class ImportExportFrame(tk.Frame):
+    """Onglet Import/Export : exporter un bon en .ems, l'importer ou le modifier hors-ligne."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C["bg"])
+        self.app = app
+        self._bundle      = None   # bundle chargé depuis un fichier .ems
+        self._bundle_path = None
+        self._exp_cache   = []     # liste des bons affichés dans le panneau export
+
+        mk_header(self, "Import / Export", "   Transfert de bons hors connexion")
+
+        # ── Bandeau statut connexion ─────────────────────────────────────────
+        self._st_frame = tk.Frame(self, bg="#1a3a1a")
+        self._st_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self._st_lbl = tk.Label(self._st_frame, text="Vérification…",
+                                 font=("Arial", 9), bg="#1a3a1a", fg="#a0f0a0", anchor="w")
+        self._st_lbl.pack(side="left", padx=10, pady=4)
+        tk.Button(self._st_frame, text="↻ Actualiser", command=self._check_connexion,
+                  font=("Arial", 8), relief="flat",
+                  bg="#1a3a1a", fg="#88cc88", bd=0).pack(side="right", padx=8)
+
+        # ── Deux panneaux côte à côte ────────────────────────────────────────
+        panels = tk.Frame(self, bg=C["bg"])
+        panels.pack(fill="both", expand=True, padx=20, pady=4)
+        panels.columnconfigure(0, weight=1)
+        panels.columnconfigure(1, weight=1)
+        panels.rowconfigure(0, weight=1)
+
+        self._build_import_panel(panels)
+        self._build_export_panel(panels)
+
+        self.after(200, self._check_connexion)
+
+    # ── Connexion ─────────────────────────────────────────────────────────────
+    def _check_connexion(self):
+        """Vérifie la connexion en thread de fond pour ne pas bloquer l'UI."""
+        import threading
+        def _bg():
+            en_ligne = db.ping(timeout=2.0)
+            if en_ligne:
+                bg, fg, txt = "#1a3a1a", "#a0f0a0", "● Serveur en ligne — connexion active"
+            else:
+                bg, fg, txt = "#3a1a1a", "#f0a0a0", "○ Serveur hors ligne — mode import/export uniquement"
+            try:
+                self.after(0, lambda: (
+                    self._st_frame.config(bg=bg) or
+                    self._st_lbl.config(bg=bg, fg=fg, text=txt)
+                ))
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
+        self.after(15000, self._check_connexion)
+
+    # ── Panneau EXPORTER ──────────────────────────────────────────────────────
+    def _build_export_panel(self, parent):
+        lf = tk.LabelFrame(parent, text="  📤  Exporter un bon  ",
+                            font=("Arial", 10, "bold"),
+                            bg=C["bg"], fg=C["header"], bd=1, relief="groove",
+                            padx=8, pady=8)
+        lf.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
+        lf.rowconfigure(1, weight=1)
+        lf.columnconfigure(0, weight=1)
+
+        tk.Label(lf, text="Sélectionnez un bon à exporter vers un fichier .ems :",
+                 bg=C["bg"], font=("Arial", 9)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        # Barre de recherche
+        sf = tk.Frame(lf, bg=C["bg"])
+        sf.grid(row=0, column=0, sticky="ew")
+        tk.Label(sf, text="🔍", bg=C["bg"]).pack(side="left")
+        self._exp_search = tk.StringVar()
+        self._exp_search.trace_add("write", lambda *_: self._refresh_export_list())
+        ttk.Entry(sf, textvariable=self._exp_search, width=22).pack(side="left", padx=4)
+
+        # Treeview liste des bons
+        col_defs = [("num_bon", "N° Bon", 105), ("date", "Date", 80),
+                    ("client", "Client", 145), ("statut", "Statut", 78)]
+        tf, self._exp_tree = mk_tree(lf, ("num_bon","date","client","statut"), col_defs, height=14)
+        tf.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        mk_btn(lf, "📤 Exporter le bon sélectionné (.ems)", self._exporter
+               ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+    # ── Panneau IMPORTER ──────────────────────────────────────────────────────
+    def _build_import_panel(self, parent):
+        lf = tk.LabelFrame(parent, text="  📥  Importer / Modifier hors-ligne  ",
+                            font=("Arial", 10, "bold"),
+                            bg=C["bg"], fg=C["header"], bd=1, relief="groove",
+                            padx=8, pady=8)
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
+        lf.columnconfigure(0, weight=1)
+
+        # Sélection du fichier
+        ff = tk.Frame(lf, bg=C["bg"])
+        ff.pack(fill="x", pady=(0, 8))
+        mk_btn(ff, "📁 Ouvrir un fichier .ems…", self._choisir_fichier,
+               color=C["btn2"]).pack(side="right", padx=(8, 0))
+        self._file_var = tk.StringVar(value="Aucun fichier sélectionné")
+        tk.Label(ff, textvariable=self._file_var, bg=C["bg"], font=("Arial", 9),
+                 fg=C["header"], wraplength=260, justify="left").pack(side="left", fill="x", expand=True)
+
+        # Aperçu
+        pf = tk.LabelFrame(lf, text=" Aperçu ", font=("Arial", 9, "bold"),
+                            bg=C["bg"], fg=C["header"], bd=1, relief="groove",
+                            padx=6, pady=6)
+        pf.pack(fill="x", pady=(0, 10))
+        self._prev_vars = {}
+        for lbl, key in [("N° Bon", "num_bon"), ("Date", "date_creation"),
+                          ("Client", "client_nom"), ("Statut", "statut"),
+                          ("Technicien(s)", "technicien"),
+                          ("Modif. hors-ligne", "_offline")]:
+            r = tk.Frame(pf, bg=C["bg"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=lbl + " :", bg=C["bg"], font=("Arial", 9),
+                     width=17, anchor="e").pack(side="left")
+            v = tk.StringVar(value="—")
+            self._prev_vars[key] = v
+            tk.Label(r, textvariable=v, bg=C["bg"], font=("Arial", 9),
+                     anchor="w").pack(side="left", padx=4)
+
+        # Boutons d'action
+        self._btn_import = mk_btn(lf, "🔁 Importer en ligne (synchroniser)", self._importer)
+        self._btn_import.pack(fill="x", pady=(0, 4))
+        self._btn_import.config(state="disabled", fg="white",
+                                activeforeground="white", disabledforeground="white")
+
+        self._btn_offline = mk_btn(lf, "✏️ Ouvrir et modifier hors-ligne",
+                                    self._modifier_hors_ligne, color=C["btn3"])
+        self._btn_offline.pack(fill="x", pady=(0, 4))
+        self._btn_offline.config(state="disabled", fg="white",
+                                 activeforeground="white", disabledforeground="white")
+
+        tk.Label(lf,
+                 text="ℹ️  Flux de travail :\n"
+                      "1. Exportez un bon depuis le panneau droit\n"
+                      "2. Transférez le fichier .ems sur un PC hors connexion\n"
+                      "3. Ouvrez-le ici avec « Modifier hors-ligne »\n"
+                      "4. Une fois en ligne, importez pour synchroniser",
+                 bg=C["bg"], font=("Arial", 8), fg="#333",
+                 justify="left").pack(anchor="w", pady=(8, 0))
+
+    # ── Dossier de travail .ems ───────────────────────────────────────────────
+    @staticmethod
+    def _ems_folder() -> Path:
+        """Retourne (et crée si besoin) le dossier bons_ems/ à la racine du projet."""
+        import sys
+        base = (Path(sys.executable).parent
+                if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parent.parent)
+        folder = base / "bons_ems"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    # ── Actualisation de la liste export ──────────────────────────────────────
+    def _refresh_export_list(self):
+        q = self._exp_search.get()
+        try:
+            invs = db.get_interventions(search=q)
+        except Exception:
+            invs = []
+        self._exp_cache = list(invs)
+        rows = [(r["num_bon"], r.get("date_creation", ""),
+                 r.get("client_nom") or "", r.get("statut", ""))
+                for r in self._exp_cache]
+        fill_tree(self._exp_tree, rows)
+
+    def refresh(self):
+        self._refresh_export_list()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    def _sel_export(self):
+        sel = self._exp_tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un bon à exporter.")
+            return None
+        return self._exp_cache[int(sel[0])]
+
+    def _exporter(self):
+        r = self._sel_export()
+        if not r:
+            return
+        try:
+            inv        = db.get_intervention(inv_id=r["id"])
+            clients    = list(db.get_clients())
+            moteurs    = list(db.get_moteurs())
+            techniciens = list(db.get_techniciens())
+            types      = list(db.get_types_intervention())
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible de charger les données :\n{e}")
+            return
+
+        from shared import import_export as ie
+        bundle   = ie.build_bundle(inv, clients, moteurs, techniciens, types)
+        num      = r["num_bon"].replace("/", "-").replace("\\", "-")
+        path = filedialog.asksaveasfilename(
+            title="Enregistrer le bon exporté",
+            initialdir=str(self._ems_folder()),
+            initialfile=f"{num}.ems",
+            defaultextension=".ems",
+            filetypes=[("Bon EMS", "*.ems"), ("JSON", "*.json"), ("Tous", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            ie.save_bundle(bundle, path)
+            messagebox.showinfo("Export réussi",
+                f"✅ Bon {r['num_bon']} exporté.\n\n{path}\n\n"
+                "Transférez ce fichier sur le PC hors connexion pour compléter\n"
+                "l'intervention, puis importez-le ici une fois de retour.")
+        except Exception as e:
+            messagebox.showerror("Erreur d'export", str(e))
+
+    # ── Choisir fichier à importer ────────────────────────────────────────────
+    def _choisir_fichier(self):
+        path = filedialog.askopenfilename(
+            title="Ouvrir un bon exporté (.ems)",
+            initialdir=str(self._ems_folder()),
+            filetypes=[("Bon EMS", "*.ems"), ("JSON", "*.json"), ("Tous", "*.*")],
+        )
+        if not path:
+            return
+        from shared import import_export as ie
+        try:
+            bundle = ie.load_bundle(path)
+        except Exception as e:
+            messagebox.showerror("Fichier invalide", str(e))
+            return
+
+        self._bundle      = bundle
+        self._bundle_path = path
+        self._file_var.set(path)
+
+        inv = bundle["intervention"]
+        self._prev_vars["num_bon"].set(inv.get("num_bon", "?"))
+        self._prev_vars["date_creation"].set(inv.get("date_creation", "?"))
+        self._prev_vars["client_nom"].set(
+            inv.get("client_nom") or inv.get("client_id") or "?")
+        self._prev_vars["statut"].set(inv.get("statut", "?"))
+        self._prev_vars["technicien"].set(inv.get("technicien", "?"))
+        self._prev_vars["_offline"].set(
+            "✅ Oui" if bundle.get("offline_edits") else "Non")
+
+        self._btn_import.config(state="normal", fg="white", activeforeground="white")
+        self._btn_offline.config(state="normal", fg="white", activeforeground="white")
+
+    # ── Importer en ligne ─────────────────────────────────────────────────────
+    def _importer(self):
+        if not self._bundle:
+            return
+        orig  = self._bundle.get("intervention", {})
+        edits = self._bundle.get("offline_edits") or {}
+        data  = {**orig, **edits}
+        base_ver = int(orig.get("version", 0))
+
+        def _do_push(force=False):
+            return db.push_bons(
+                [{"data": data, "base_version": base_ver, "force": force}],
+                device="bureau-import")
+
+        try:
+            result = _do_push()
+        except Exception as e:
+            messagebox.showerror("Erreur de synchronisation", str(e))
+            return
+
+        appliques = result.get("appliques", 0)
+        conflits  = result.get("conflits", [])
+        erreurs   = result.get("erreurs", [])
+
+        if erreurs:
+            messagebox.showerror("Erreurs d'import", "\n".join(erreurs))
+            return
+
+        if conflits:
+            c = conflits[0]
+            if messagebox.askyesno("Conflit de version",
+                    f"Le bon {c['num_bon']} a été modifié sur le serveur\n"
+                    f"(version serveur : {c['serveur_version']}, "
+                    f"version exportée : {c['base_version']}).\n\n"
+                    "Écraser la version serveur avec la version importée ?"):
+                try:
+                    result2 = _do_push(force=True)
+                    messagebox.showinfo("Import réussi (forcé)",
+                        f"✅ {result2.get('appliques', 0)} bon(s) synchronisé(s).")
+                except Exception as e2:
+                    messagebox.showerror("Erreur", str(e2))
+            return
+
+        messagebox.showinfo("Import réussi",
+            f"✅ {appliques} bon(s) synchronisé(s) avec le serveur.")
+
+        for key in ("interventions", "dashboard"):
+            if self.app.frames.get(key):
+                self.app.frames[key].refresh()
+
+    # ── Modifier hors-ligne ───────────────────────────────────────────────────
+    def _modifier_hors_ligne(self):
+        if not self._bundle:
+            return
+        bundle      = self._bundle
+        bundle_path = self._bundle_path
+
+        def _on_offline_save(edits):
+            from shared import import_export as ie
+            ie.apply_offline_edits(bundle, edits, bundle_path)
+            self._prev_vars["_offline"].set("✅ Oui")
+            messagebox.showinfo("Enregistré localement",
+                f"✅ Modifications enregistrées dans :\n{bundle_path}\n\n"
+                "Pour les synchroniser, reconnectez-vous et utilisez\n"
+                "« Importer en ligne ».")
+
+        BonDialog(self, self.app,
+                  offline_bundle=bundle,
+                  offline_path=bundle_path,
+                  on_offline_save=_on_offline_save)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WIDGET TABLEAU MATÉRIELS (avec autocomplete pièces détachées, popup flottant)
 # ══════════════════════════════════════════════════════════════════════════════
 class MaterielsTable(tk.Frame):
@@ -3459,53 +4030,94 @@ class MaterielsTable(tk.Frame):
 # ══════════════════════════════════════════════════════════════════════════════
 # WIDGET TEMPS & FRAIS (anciennement DEPLACEMENTS)
 # ══════════════════════════════════════════════════════════════════════════════
-class DeplacementsTable(tk.Frame):
-    """Saisie des temps et frais lies a l'intervention.
-    
-    Champs texte : trajet aller-retour, duree intervention,
-                   temps preparation, temps rangement.
-    Cases a cocher : frais repas, frais hotel, frais peages.
-    
-    Le 'load' assure la retrocompat avec l'ancien format
-    (trajet_aller/trajet_retour, heure_debut_matin, etc.).
-    """
-    # Champs texte : (cle, libelle)
+import re as _re_depl
+
+def _parse_h(s):
+    """Parse '2h30', '1:30', '2.5', '30min' en heures (float). None si inconnu."""
+    s = str(s).strip().lower().replace(',', '.')
+    if not s:
+        return None
+    m = _re_depl.match(r'^(\d+):(\d{2})$', s)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60
+    m = _re_depl.match(r'^(\d+(?:\.\d+)?)h(\d{0,2})$', s)
+    if m:
+        return float(m.group(1)) + (int(m.group(2)) if m.group(2) else 0) / 60
+    m = _re_depl.match(r'^(\d+(?:\.\d+)?)min$', s)
+    if m:
+        return float(m.group(1)) / 60
+    m = _re_depl.match(r'^(\d+(?:\.\d+)?)$', s)
+    if m:
+        return float(m.group(1))
+    return None
+
+def _fmt_h(h):
+    hi = int(h)
+    mi = round((h - hi) * 60)
+    if mi == 60:
+        hi += 1; mi = 0
+    return f"{hi}h{mi:02d}" if mi else f"{hi}h"
+
+
+class TechnicienFrame(tk.Frame):
+    """Champs temps & frais pour un technicien au sein d'une journee."""
     TEXTE_FIELDS = [
-        ("trajet_aller_retour", "Trajet aller-retour"),
+        ("trajet_aller_retour", "Temps de trajet"),
         ("duree_intervention",  "Duree de l'intervention"),
         ("temps_preparation",   "Temps de preparation"),
         ("temps_rangement",     "Temps de rangement"),
     ]
-    # Cases a cocher : (cle, libelle)
     CHECK_FIELDS = [
         ("frais_repas",  "Frais de repas"),
         ("frais_hotel",  "Frais d'hotel"),
         ("frais_peages", "Frais de peages"),
     ]
 
-    def __init__(self, master, **kw):
-        super().__init__(master, bg=C["bg"], **kw)
-        self.vars = {}       # cle -> StringVar (champs texte)
-        self.check_vars = {} # cle -> IntVar (cases)
+    def __init__(self, master, numero, on_change=None, **kw):
+        super().__init__(master, bg=C["bg"], relief="solid", bd=1, **kw)
+        self.numero = numero
+        self.vars = {}
+        self.check_vars = {}
 
-        # Bloc gauche : champs texte (4 lignes)
+        head = tk.Frame(self, bg="#f5f7fa")
+        head.pack(fill="x")
+        self._num_lbl = tk.Label(head, text=f"Technicien {numero}",
+                                  bg="#f5f7fa", font=("Arial", 8, "bold"),
+                                  fg="#4a5560")
+        self._num_lbl.pack(side="left", padx=6, pady=2)
+        self._del_btn = tk.Button(head, text="✕", bg="#f5f7fa",
+                                   fg="#c62828", bd=0,
+                                   font=("Arial", 8, "bold"), cursor="hand2",
+                                   activebackground="#f5f7fa")
+        self._del_btn.pack(side="right", padx=4, pady=1)
+
+        inner = tk.Frame(self, bg=C["bg"])
+        inner.pack(fill="x", padx=6, pady=3)
+
+        # Nom
+        row_nom = tk.Frame(inner, bg=C["bg"])
+        row_nom.pack(fill="x", pady=1)
+        tk.Label(row_nom, text="Technicien", bg=C["bg"], font=("Arial", 9),
+                 width=30, anchor="w").pack(side="left", padx=(0, 4))
+        self.vars["nom"] = tk.StringVar()
+        nom_e = ttk.Entry(row_nom, textvariable=self.vars["nom"], width=18)
+        nom_e.pack(side="left")
+        if on_change:
+            self.vars["nom"].trace_add("write", lambda *_: on_change())
+
         for key, lbl in self.TEXTE_FIELDS:
-            row = tk.Frame(self, bg=C["bg"])
-            row.pack(fill="x", pady=2)
+            row = tk.Frame(inner, bg=C["bg"])
+            row.pack(fill="x", pady=1)
             tk.Label(row, text=lbl, bg=C["bg"], font=("Arial", 9),
                      width=30, anchor="w").pack(side="left", padx=(0, 4))
             self.vars[key] = tk.StringVar()
             ttk.Entry(row, textvariable=self.vars[key], width=18).pack(side="left")
+            if on_change:
+                self.vars[key].trace_add("write", lambda *_: on_change())
 
-        # Separateur visuel + cases a cocher (frais)
-        sep = tk.Frame(self, bg="#d0d4d9", height=1)
-        sep.pack(fill="x", pady=(8, 4))
-
-        tk.Label(self, text="Frais :", bg=C["bg"],
-                 font=("Arial", 9, "bold"), anchor="w").pack(
-                     anchor="w", padx=(0, 4))
-
-        chk_row = tk.Frame(self, bg=C["bg"])
+        sep = tk.Frame(inner, bg="#d0d4d9", height=1)
+        sep.pack(fill="x", pady=(3, 1))
+        chk_row = tk.Frame(inner, bg=C["bg"])
         chk_row.pack(fill="x", pady=2)
         for key, lbl in self.CHECK_FIELDS:
             self.check_vars[key] = tk.IntVar(value=0)
@@ -3513,53 +4125,330 @@ class DeplacementsTable(tk.Frame):
                            variable=self.check_vars[key],
                            bg=C["bg"], font=("Arial", 9),
                            activebackground=C["bg"],
-                           selectcolor="white").pack(side="left", padx=(0, 18))
+                           selectcolor="white").pack(side="left", padx=(0, 14))
+            if on_change:
+                self.check_vars[key].trace_add("write", lambda *_: on_change())
+
+    def set_numero(self, n):
+        self.numero = n
+        self._num_lbl.config(text=f"Technicien {n}")
+
+    def set_delete_visible(self, visible):
+        self._del_btn.config(state="normal" if visible else "disabled",
+                             fg="#c62828" if visible else "#b8c0c9")
 
     def load(self, data):
-        """Charge les valeurs depuis le JSON. Gere la retrocompat avec
-        l'ancien format (trajet_aller + trajet_retour -> trajet_aller_retour, etc.)"""
         if not data:
             data = {}
-        # Champs texte
-        for key, _ in self.TEXTE_FIELDS:
-            val = data.get(key, "")
-            # Retrocompat : si pas de valeur nouvelle, essayer agreger ancienne
-            if not val:
-                if key == "trajet_aller_retour":
-                    aller = str(data.get("trajet_aller", "")).strip()
-                    retour = str(data.get("trajet_retour", "")).strip()
-                    if aller and retour:
-                        val = f"Aller : {aller} / Retour : {retour}"
-                    else:
-                        val = aller or retour
-                elif key == "duree_intervention":
-                    # Tenter de combiner heure_debut_matin / heure_fin_apres
-                    debut = str(data.get("heure_debut_matin", "")).strip()
-                    fin = str(data.get("heure_fin_apres", "")).strip()
-                    if debut and fin:
-                        val = f"{debut} -> {fin}"
-                    else:
-                        val = debut or fin
-            self.vars[key].set(str(val))
-        # Cases a cocher : 1 si valeur truthy
+        for key in ["nom"] + [k for k, _ in self.TEXTE_FIELDS]:
+            self.vars[key].set(str(data.get(key, "")))
         for key, _ in self.CHECK_FIELDS:
             v = data.get(key, 0)
-            # Retrocompat : ancien format stockait texte (montant) ou 0
             try:
                 self.check_vars[key].set(1 if int(v) else 0)
             except (ValueError, TypeError):
-                # Texte non vide = case cochee
                 self.check_vars[key].set(1 if str(v).strip() else 0)
 
     def to_dict(self):
         out = {}
-        for key, _ in self.TEXTE_FIELDS:
+        for key in ["nom"] + [k for k, _ in self.TEXTE_FIELDS]:
             v = self.vars[key].get().strip()
             if v:
                 out[key] = v
         for key, _ in self.CHECK_FIELDS:
             out[key] = int(self.check_vars[key].get())
         return out
+
+
+class JourFrame(tk.Frame):
+    """Une journee d'intervention : date + un ou plusieurs techniciens."""
+
+    def __init__(self, master, numero, on_change=None, **kw):
+        super().__init__(master, bg=C["bg"], relief="groove", bd=1, **kw)
+        self.numero = numero
+        self._tech_frames = []
+        self._on_change = on_change
+        self.date_var = tk.StringVar()
+        if on_change:
+            self.date_var.trace_add("write", lambda *_: on_change())
+
+        head = tk.Frame(self, bg="#eef2f7")
+        head.pack(fill="x")
+        self._num_lbl = tk.Label(head, text=f"Jour {numero}",
+                                  bg="#eef2f7", font=("Arial", 9, "bold"),
+                                  fg="#002b5c")
+        self._num_lbl.pack(side="left", padx=8, pady=3)
+        self._del_btn = tk.Button(head, text="✕", bg="#eef2f7",
+                                   fg="#c62828", bd=0,
+                                   font=("Arial", 9, "bold"), cursor="hand2",
+                                   activebackground="#eef2f7")
+        self._del_btn.pack(side="right", padx=6, pady=1)
+
+        date_row = tk.Frame(self, bg=C["bg"])
+        date_row.pack(fill="x", padx=8, pady=(4, 2))
+        tk.Label(date_row, text="Date", bg=C["bg"], font=("Arial", 9),
+                 width=30, anchor="w").pack(side="left", padx=(0, 4))
+        ttk.Entry(date_row, textvariable=self.date_var, width=18).pack(side="left")
+
+        self._tech_container = tk.Frame(self, bg=C["bg"])
+        self._tech_container.pack(fill="x", padx=8, pady=(2, 2))
+
+        add_row = tk.Frame(self, bg=C["bg"])
+        add_row.pack(fill="x", padx=8, pady=(2, 6))
+        mk_btn(add_row, "+ Technicien", self._ajouter_tech,
+               color=C["btn2"]).pack(side="left")
+
+        self._ajouter_tech()
+
+    def _ajouter_tech(self, data=None):
+        tf = TechnicienFrame(self._tech_container,
+                              len(self._tech_frames) + 1,
+                              on_change=self._on_change)
+        tf._del_btn.config(command=lambda f=tf: self._supprimer_tech(f))
+        self._tech_frames.append(tf)
+        tf.pack(fill="x", pady=(0, 4))
+        if data:
+            tf.load(data)
+        self._update_tech_delete()
+
+    def _supprimer_tech(self, tf):
+        if len(self._tech_frames) <= 1:
+            return
+        self._tech_frames.remove(tf)
+        tf.destroy()
+        for i, f in enumerate(self._tech_frames, 1):
+            f.set_numero(i)
+        self._update_tech_delete()
+        if self._on_change:
+            self._on_change()
+
+    def _update_tech_delete(self):
+        show = len(self._tech_frames) > 1
+        for tf in self._tech_frames:
+            tf.set_delete_visible(show)
+
+    def set_numero(self, n):
+        self.numero = n
+        self._num_lbl.config(text=f"Jour {n}")
+
+    def set_delete_visible(self, visible):
+        self._del_btn.config(state="normal" if visible else "disabled",
+                             fg="#c62828" if visible else "#b8c0c9")
+
+    def load(self, data):
+        if not data:
+            data = {}
+        self.date_var.set(str(data.get("date", "")))
+        techs = data.get("techniciens")
+        if techs and isinstance(techs, list):
+            while len(self._tech_frames) > len(techs):
+                tf = self._tech_frames.pop(); tf.destroy()
+            while len(self._tech_frames) < len(techs):
+                self._ajouter_tech()
+            if not self._tech_frames:
+                self._ajouter_tech()
+            for tf, td in zip(self._tech_frames, techs):
+                tf.load(td)
+            for i, tf in enumerate(self._tech_frames, 1):
+                tf.set_numero(i)
+            self._update_tech_delete()
+        else:
+            # Retrocompat : charger les champs plats comme technicien 1
+            while len(self._tech_frames) > 1:
+                tf = self._tech_frames.pop(); tf.destroy()
+            self._update_tech_delete()
+            self._tech_frames[0].load(data)
+
+    def sync_techniciens(self, names):
+        """Ajoute un TechnicienFrame pour chaque nom manquant dans ce jour.
+        Réutilise les frames vides (sans nom) plutôt qu'en créer de nouveaux."""
+        named_frames = [tf for tf in self._tech_frames if tf.vars["nom"].get().strip()]
+        empty_frames = [tf for tf in self._tech_frames if not tf.vars["nom"].get().strip()]
+        existing_names = {tf.vars["nom"].get().strip() for tf in named_frames}
+        for name in names:
+            if not name or name in existing_names:
+                continue
+            if empty_frames:
+                tf = empty_frames.pop(0)
+                tf.vars["nom"].set(name)
+            else:
+                self._ajouter_tech({"nom": name})
+            existing_names.add(name)
+        self._update_tech_delete()
+
+    def to_dict(self):
+        return {"date": self.date_var.get().strip(),
+                "techniciens": [tf.to_dict() for tf in self._tech_frames]}
+
+
+class DeplacementsTable(tk.Frame):
+    """Saisie des temps et frais : plusieurs jours, plusieurs techniciens par jour."""
+
+    _T_KEYS = [("trajet_aller_retour", "Trajet A/R"),
+               ("duree_intervention",  "Duree intervention"),
+               ("temps_preparation",   "Preparation"),
+               ("temps_rangement",     "Rangement")]
+    _F_KEYS = [("frais_repas", "Repas"),
+               ("frais_hotel", "Hotel"),
+               ("frais_peages", "Peages")]
+
+    def __init__(self, master, **kw):
+        super().__init__(master, bg=C["bg"], **kw)
+        self._jour_frames = []
+        self._total_job  = None
+        self._total_vars = {}
+        self._current_techniciens = []
+
+        self._container = tk.Frame(self, bg=C["bg"])
+        self._container.pack(fill="x")
+
+        add_row = tk.Frame(self, bg=C["bg"])
+        add_row.pack(fill="x", pady=(6, 0))
+        mk_btn(add_row, "+ Ajouter un jour", self._ajouter_jour,
+               color=C["btn2"]).pack(side="left")
+
+        # Section TOTAUX
+        tk.Frame(self, bg="#002b5c", height=2).pack(fill="x", pady=(10, 4))
+        tk.Label(self, text="TOTAUX", bg=C["bg"],
+                 font=("Arial", 9, "bold"), fg="#002b5c").pack(anchor="w")
+        tot_f = tk.Frame(self, bg=C["bg"])
+        tot_f.pack(fill="x")
+        for key, lbl in self._T_KEYS:
+            row = tk.Frame(tot_f, bg=C["bg"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=lbl, bg=C["bg"], font=("Arial", 9),
+                     width=30, anchor="w").pack(side="left", padx=(0, 4))
+            self._total_vars[key] = tk.StringVar(value="—")
+            tk.Label(row, textvariable=self._total_vars[key],
+                     bg="#f0f4f8", font=("Arial", 9, "bold"), fg="#002b5c",
+                     width=14, anchor="w", relief="groove",
+                     padx=6).pack(side="left")
+
+        frais_row = tk.Frame(tot_f, bg=C["bg"])
+        frais_row.pack(fill="x", pady=(4, 0))
+        for key, lbl in self._F_KEYS:
+            self._total_vars[key] = tk.StringVar(value="0")
+            tk.Label(frais_row, text=f"{lbl} :", bg=C["bg"],
+                     font=("Arial", 9)).pack(side="left", padx=(0, 2))
+            tk.Label(frais_row, textvariable=self._total_vars[key],
+                     bg="#f0f4f8", font=("Arial", 9, "bold"), fg="#002b5c",
+                     width=3, anchor="center",
+                     relief="groove").pack(side="left", padx=(0, 10))
+
+        self._ajouter_jour()
+
+    # ── gestion jours ────────────────────────────────────────────────────────
+
+    def _ajouter_jour(self, data=None):
+        jf = JourFrame(self._container, len(self._jour_frames) + 1,
+                       on_change=self._schedule_totals)
+        jf._del_btn.config(command=lambda f=jf: self._supprimer_jour(f))
+        self._jour_frames.append(jf)
+        jf.pack(fill="x", pady=(0, 6))
+        if data:
+            jf.load(data)
+        else:
+            techs = self._current_techniciens
+            if not techs and len(self._jour_frames) > 1:
+                techs = [tf.vars["nom"].get().strip()
+                         for tf in self._jour_frames[0]._tech_frames
+                         if tf.vars["nom"].get().strip()]
+            if techs:
+                jf.sync_techniciens(techs)
+        self._update_jour_delete()
+        self._schedule_totals()
+
+    def _supprimer_jour(self, jf):
+        if len(self._jour_frames) <= 1:
+            return
+        self._jour_frames.remove(jf)
+        jf.destroy()
+        for i, f in enumerate(self._jour_frames, 1):
+            f.set_numero(i)
+        self._update_jour_delete()
+        self._schedule_totals()
+
+    def _update_jour_delete(self):
+        show = len(self._jour_frames) > 1
+        for jf in self._jour_frames:
+            jf.set_delete_visible(show)
+
+    # ── totaux ───────────────────────────────────────────────────────────────
+
+    def _schedule_totals(self):
+        if self._total_job is not None:
+            self.after_cancel(self._total_job)
+        self._total_job = self.after(250, self._recalculate_totals)
+
+    def _recalculate_totals(self):
+        self._total_job = None
+        sums  = {k: None for k, _ in self._T_KEYS}
+        frais = {k: 0    for k, _ in self._F_KEYS}
+        for jf in self._jour_frames:
+            for tf in jf._tech_frames:
+                for key, _ in self._T_KEYS:
+                    v = _parse_h(tf.vars[key].get())
+                    if v is not None:
+                        sums[key] = (sums[key] or 0) + v
+                for key, _ in self._F_KEYS:
+                    frais[key] += int(tf.check_vars[key].get())
+        for key, _ in self._T_KEYS:
+            self._total_vars[key].set(_fmt_h(sums[key]) if sums[key] is not None else "—")
+        for key, _ in self._F_KEYS:
+            self._total_vars[key].set(str(frais[key]))
+
+    # ── load / save ──────────────────────────────────────────────────────────
+
+    def load(self, data):
+        if not data:
+            data = {}
+        jours = data.get("jours")
+        if jours and isinstance(jours, list):
+            while len(self._jour_frames) > len(jours):
+                jf = self._jour_frames.pop(); jf.destroy()
+            while len(self._jour_frames) < len(jours):
+                self._ajouter_jour()
+            if not self._jour_frames:
+                self._ajouter_jour()
+            for jf, jdata in zip(self._jour_frames, jours):
+                jf.load(jdata)
+            for i, jf in enumerate(self._jour_frames, 1):
+                jf.set_numero(i)
+            self._update_jour_delete()
+        else:
+            # Retrocompat : ancien format plat
+            while len(self._jour_frames) > 1:
+                jf = self._jour_frames.pop(); jf.destroy()
+            self._update_jour_delete()
+            converted = {}
+            for key in ["trajet_aller_retour", "duree_intervention",
+                        "temps_preparation", "temps_rangement"]:
+                val = data.get(key, "")
+                if not val:
+                    if key == "trajet_aller_retour":
+                        a = str(data.get("trajet_aller", "")).strip()
+                        r = str(data.get("trajet_retour", "")).strip()
+                        val = f"Aller : {a} / Retour : {r}" if a and r else a or r
+                    elif key == "duree_intervention":
+                        deb = str(data.get("heure_debut_matin", "")).strip()
+                        fin = str(data.get("heure_fin_apres", "")).strip()
+                        val = f"{deb} -> {fin}" if deb and fin else deb or fin
+                converted[key] = val
+            for key in ["frais_repas", "frais_hotel", "frais_peages"]:
+                converted[key] = data.get(key, 0)
+            self._jour_frames[0].load(
+                {"date": "", "techniciens": [converted]})
+        self._recalculate_totals()
+
+    def to_dict(self):
+        return {"jours": [jf.to_dict() for jf in self._jour_frames]}
+
+    def sync_techniciens(self, names):
+        """Met à jour tous les jours avec les techniciens du bon."""
+        self._current_techniciens = list(names)
+        for jf in self._jour_frames:
+            jf.sync_techniciens(names)
+        self._schedule_totals()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DIALOG CLIENT
@@ -3709,6 +4598,13 @@ class MoteurFicheDialog(tk.Toplevel):
         else:
             gtxt, gcol = "Garantie : —", "#6b7785"
 
+        cu_parts = [
+            moteur.get("client_utilisateur_nom", ""),
+            moteur.get("client_utilisateur_tel", ""),
+            moteur.get("client_utilisateur_email", ""),
+            moteur.get("client_utilisateur_adresse", ""),
+        ]
+        client_utilisateur_str = "  |  ".join(p for p in cu_parts if p)
         champs = [
             ("N° série", moteur.get("num_serie", "")),
             ("Marque", moteur.get("marque", "")),
@@ -3721,6 +4617,7 @@ class MoteurFicheDialog(tk.Toplevel):
             ("Mise en service", moteur.get("date_mise_service", "")),
             ("Durée garantie", f"{moteur.get('duree_garantie', '')} mois"
                 if moteur.get("duree_garantie") else ""),
+            ("Client utilisateur", client_utilisateur_str),
         ]
         for i, (lbl, val) in enumerate(champs):
             r, c = divmod(i, 2)
@@ -3728,8 +4625,32 @@ class MoteurFicheDialog(tk.Toplevel):
             cell.grid(row=r, column=c, sticky="w", padx=10, pady=2)
             tk.Label(cell, text=f"{lbl} : ", bg=C["surface"],
                      font=("Arial", 9, "bold"), fg="#555").pack(side="left")
-            tk.Label(cell, text=str(val) or "—", bg=C["surface"],
-                     font=("Arial", 9), fg="#1a2332").pack(side="left")
+            if lbl == "Code affaire" and val:
+                def _open_affaire_folder(code=val):
+                    try:
+                        affaires = db.get_affaires(search=code)
+                        match = next((a for a in affaires
+                                      if a.get("num_affaire") == code
+                                      or a.get("ref_interne") == code), None)
+                        if match and match.get("dossier_path"):
+                            import os as _os
+                            p = Path(match["dossier_path"])
+                            if p.exists():
+                                _os.startfile(str(p))
+                                return
+                        messagebox.showinfo("Dossier affaire",
+                            f"Aucun dossier trouvé pour le code '{code}'.\n"
+                            "Vérifiez que l'affaire existe dans l'app Affaires.")
+                    except Exception as e:
+                        messagebox.showerror("Erreur", str(e))
+                lnk = tk.Label(cell, text=str(val), bg=C["surface"],
+                               font=("Arial", 9, "underline"), fg="#d97706",
+                               cursor="hand2")
+                lnk.pack(side="left")
+                lnk.bind("<Button-1>", lambda _, fn=_open_affaire_folder: fn())
+            else:
+                tk.Label(cell, text=str(val) or "—", bg=C["surface"],
+                         font=("Arial", 9), fg="#1a2332").pack(side="left")
         # Badge garantie
         tk.Label(grille, text=gtxt, bg=C["surface"], fg=gcol,
                  font=("Arial", 10, "bold")).grid(
@@ -3768,6 +4689,27 @@ class MoteurFicheDialog(tk.Toplevel):
         af_gar = tk.Frame(tab_gar, bg=C["bg"]); af_gar.pack(fill="x", padx=8, pady=(0, 6))
         mk_btn(af_gar, "📁 Ouvrir dossier", self._ouvrir_dossier_gar).pack(side="left", padx=4)
         self.tree_gar.bind("<Double-1>", lambda _: self._ouvrir_dossier_gar())
+
+        # --- Onglet Sous-ensembles ---
+        tab_se = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab_se, text="  Sous-ensembles  ")
+        cols3 = ("libelle", "reference", "marque", "num_serie", "etat", "notes")
+        col_defs3 = [
+            ("libelle",   "Libellé",    200),
+            ("reference", "Référence",  110),
+            ("marque",    "Marque",      90),
+            ("num_serie", "N° Série",   120),
+            ("etat",      "État",        85),
+            ("notes",     "Notes",      160),
+        ]
+        tf3, self.tree_se = mk_tree(tab_se, cols3, col_defs3, height=9)
+        tf3.pack(fill="both", expand=True, padx=8, pady=(6, 2))
+        self._se_cache = []
+        af_se = tk.Frame(tab_se, bg=C["bg"]); af_se.pack(fill="x", padx=8, pady=(0, 6))
+        mk_btn(af_se, "➕ Ajouter", self._se_add).pack(side="left", padx=4)
+        mk_btn(af_se, "✏️ Modifier", self._se_edit, color=C["btn2"]).pack(side="left", padx=4)
+        mk_btn(af_se, "🗑️ Supprimer", self._se_del, color=C["danger"]).pack(side="left", padx=4)
+        self.tree_se.bind("<Double-1>", lambda _: self._se_edit())
 
         # Boutons
         bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=10)
@@ -3813,6 +4755,62 @@ class MoteurFicheDialog(tk.Toplevel):
                             g.get("statut", ""),
                             g.get("date_ouverture", ""),
                             g.get("date_cloture", "")))
+        # Sous-ensembles
+        try:
+            self._se_cache = list(db.get_sous_ensembles(mid))
+        except Exception as e:
+            self._se_cache = []
+            print(f"[FicheMoteur] sous-ensembles : {e}")
+        self.tree_se.delete(*self.tree_se.get_children())
+        if not self._se_cache:
+            self.tree_se.insert("", "end",
+                                values=("(aucun sous-ensemble)", "", "", "", "", ""))
+        else:
+            for i, se in enumerate(self._se_cache):
+                tags = ("even" if i % 2 == 0 else "odd",)
+                self.tree_se.insert("", "end", iid=f"se_{i}",
+                    values=(se.get("libelle", ""),
+                            se.get("reference", ""),
+                            se.get("marque", ""),
+                            se.get("num_serie", ""),
+                            se.get("etat", ""),
+                            se.get("notes", "")),
+                    tags=tags)
+
+    def _se_add(self):
+        SousEnsembleDialog(self, self.app, dict(self.moteur),
+                           on_save=self._charger)
+
+    def _se_edit(self):
+        sel = self.tree_se.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.", parent=self)
+            return
+        idx = int(sel[0].replace("se_", ""))
+        if idx >= len(self._se_cache):
+            return
+        SousEnsembleDialog(self, self.app, dict(self.moteur),
+                           se=dict(self._se_cache[idx]),
+                           on_save=self._charger)
+
+    def _se_del(self):
+        sel = self.tree_se.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.", parent=self)
+            return
+        idx = int(sel[0].replace("se_", ""))
+        if idx >= len(self._se_cache):
+            return
+        se = self._se_cache[idx]
+        if not messagebox.askyesno("Supprimer",
+                f"Supprimer le sous-ensemble « {se.get('libelle', '')} » ?\n\n"
+                "Cette action est irréversible.", parent=self):
+            return
+        try:
+            db.delete_sous_ensemble(self.moteur["id"], se["id"])
+            self._charger()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e), parent=self)
 
     def _ouvrir_dossier_inv(self):
         sel = self.tree_inv.selection()
@@ -3865,20 +4863,24 @@ class MoteurFicheDialog(tk.Toplevel):
 # ══════════════════════════════════════════════════════════════════════════════
 class MoteurDialog(tk.Toplevel):
     FIELDS = [
-        ("num_serie",         "N° Série *"),
-        ("navire",            "Navire / Site"),
-        ("machine",           "Machine"),
-        ("type_moteur",       "Type moteur / inverseur"),
-        ("marque",            "Marque"),
-        ("ref_constructeur",  "Réf. Constructeur"),
-        ("cylindree",         "Cylindrée"),
-        ("famille",           "Famille"),
-        ("application",       "Application"),
-        ("typologie",         "Typologie"),
-        ("collection",        "Collection"),
-        ("code_affaire",      "Code Affaire"),
-        ("date_mise_service", "Mise en service"),
-        ("duree_garantie",    "Garantie (mois)"),
+        ("num_serie",                  "N° Série *"),
+        ("navire",                     "Navire / Site"),
+        ("machine",                    "Machine"),
+        ("type_moteur",                "Type moteur / inverseur"),
+        ("marque",                     "Marque"),
+        ("ref_constructeur",           "Réf. Constructeur"),
+        ("cylindree",                  "Cylindrée"),
+        ("famille",                    "Famille"),
+        ("application",                "Application"),
+        ("typologie",                  "Typologie"),
+        ("collection",                 "Collection"),
+        ("code_affaire",               "Code Affaire"),
+        ("date_mise_service",          "Mise en service"),
+        ("duree_garantie",             "Garantie (mois)"),
+        ("client_utilisateur_nom",     "Client utilisateur"),
+        ("client_utilisateur_email",   "Email utilisateur"),
+        ("client_utilisateur_tel",     "Tél. utilisateur"),
+        ("client_utilisateur_adresse", "Adresse utilisateur"),
     ]
 
     def __init__(self, parent, app, moteur=None, on_save=None):
@@ -3904,11 +4906,27 @@ class MoteurDialog(tk.Toplevel):
         self._client_combo.grid(row=0, column=1, pady=4, sticky="w")
         self.v = {k: tk.StringVar(value=(moteur.get(k,"") if moteur else ""))
                   for k, _ in self.FIELDS}
+        self._marque_combo = None
         for i,(key,lbl) in enumerate(self.FIELDS, start=1):
             tk.Label(f, text=lbl, bg=C["bg"], font=("Arial",10),
                      anchor="e", width=22).grid(row=i, column=0, sticky="e", padx=(0,6), pady=4)
             if key == "date_mise_service":
                 DateEntry(f, textvariable=self.v[key], width=32).grid(row=i, column=1, pady=4)
+            elif key == "client_utilisateur_email":
+                EmailEntry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
+            elif key == "client_utilisateur_adresse":
+                ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
+            elif key == "marque":
+                row_m = tk.Frame(f, bg=C["bg"])
+                row_m.grid(row=i, column=1, pady=4, sticky="w")
+                self._marque_combo = SearchableCombobox(
+                    row_m, textvariable=self.v["marque"],
+                    values=db.get_marques(), width=30)
+                self._marque_combo.pack(side="left")
+                def _open_marques():
+                    MarquesDialog(self, self.app, on_close=lambda: self._marque_combo.config(
+                        values=db.get_marques()))
+                mk_btn(row_m, "⚙", _open_marques, color=C["btn2"]).pack(side="left", padx=(8,0))
             else:
                 ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
         bf = tk.Frame(self, bg=C["bg"])
@@ -3933,6 +4951,105 @@ class MoteurDialog(tk.Toplevel):
                          moteur_id=self.moteur["id"] if self.moteur else None)
         if self.on_save: self.on_save()
         self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIALOG SOUS-ENSEMBLE
+# ══════════════════════════════════════════════════════════════════════════════
+class SousEnsembleDialog(tk.Toplevel):
+    """Ajouter ou modifier un sous-ensemble rattaché à un moteur.
+    Les infos communes du moteur (marque, navire, machine) sont préremplies.
+    """
+    ETATS = ["Neuf", "Bon état", "Usagé", "Hors service"]
+
+    def __init__(self, parent, app, moteur, se=None, on_save=None):
+        super().__init__(parent)
+        self.app = app
+        self.moteur = moteur
+        self.se = se
+        self.on_save = on_save
+        ns = moteur.get("num_serie", "")
+        titre = "Nouveau sous-ensemble" if not se else f"Modifier – {se.get('libelle', '')}"
+        self.title(f"{titre} — Moteur {ns}")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.grab_set()
+
+        # ── Bandeau contexte moteur (lecture seule) ────────────────────────
+        ctx = tk.Frame(self, bg=C["surface"], relief="solid", bd=1)
+        ctx.pack(fill="x", padx=20, pady=(14, 0))
+        tk.Label(ctx, text="Moteur associé", bg=C["surface"],
+                 font=("Arial", 9, "bold"), fg=C["header"]).pack(anchor="w", padx=10, pady=(6, 2))
+        ctx_items = [
+            ("N° Série",    moteur.get("num_serie", "—")),
+            ("Marque",      moteur.get("marque", "—")),
+            ("Navire/Site", moteur.get("navire", "—") or "—"),
+            ("Machine",     moteur.get("machine", "—") or "—"),
+            ("Client",      moteur.get("client_nom", "—") or "—"),
+        ]
+        row_ctx = tk.Frame(ctx, bg=C["surface"])
+        row_ctx.pack(fill="x", padx=10, pady=(0, 8))
+        for lbl, val in ctx_items:
+            cell = tk.Frame(row_ctx, bg=C["surface"])
+            cell.pack(side="left", padx=(0, 18))
+            tk.Label(cell, text=f"{lbl} :", bg=C["surface"],
+                     font=("Arial", 8, "bold"), fg="#888").pack(side="left")
+            tk.Label(cell, text=val, bg=C["surface"],
+                     font=("Arial", 8), fg="#1a2332").pack(side="left", padx=(3, 0))
+
+        # ── Champs du sous-ensemble ────────────────────────────────────────
+        f = tk.Frame(self, bg=C["bg"])
+        f.pack(padx=24, pady=14)
+
+        fields = [
+            ("libelle",    "Libellé *",            False),
+            ("reference",  "Référence",             False),
+            ("marque",     "Marque",                False),
+            ("num_serie",  "N° Série sous-ensemble",False),
+            ("etat",       "État",                  True),
+            ("notes",      "Notes",                 False),
+        ]
+        self._vars = {}
+        for i, (key, lbl, is_combo) in enumerate(fields):
+            if key == "marque":
+                default = (se.get("marque", "") if se else "") or moteur.get("marque", "")
+            elif key == "etat":
+                default = (se.get("etat", "") if se else "") or "Neuf"
+            else:
+                default = se.get(key, "") if se else ""
+            var = tk.StringVar(value=default)
+            self._vars[key] = var
+            tk.Label(f, text=lbl, bg=C["bg"], font=("Arial", 10),
+                     anchor="e", width=24).grid(row=i, column=0, sticky="e",
+                                                padx=(0, 6), pady=4)
+            if is_combo:
+                ttk.Combobox(f, textvariable=var, values=self.ETATS,
+                             state="readonly", width=32).grid(row=i, column=1, pady=4)
+            else:
+                ttk.Entry(f, textvariable=var, width=34).grid(row=i, column=1, pady=4)
+
+        bf = tk.Frame(self, bg=C["bg"])
+        bf.pack(pady=12)
+        mk_btn(bf, "💾 Enregistrer", self._save).pack(side="left", padx=8)
+        mk_btn(bf, "Annuler", self.destroy, color="#888").pack(side="left", padx=8)
+
+    def _save(self):
+        libelle = self._vars["libelle"].get().strip()
+        if not libelle:
+            messagebox.showwarning("Champ requis", "Le libellé est obligatoire.", parent=self)
+            return
+        data = {k: self._vars[k].get().strip() for k in self._vars}
+        try:
+            mid = self.moteur["id"]
+            if self.se:
+                db.update_sous_ensemble(mid, self.se["id"], data)
+            else:
+                db.create_sous_ensemble(mid, data)
+            if self.on_save:
+                self.on_save()
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e), parent=self)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4062,14 +5179,16 @@ class MarquesDialog(tk.Toplevel):
 
 
 class TypesDialog(tk.Toplevel):
-    def __init__(self, parent, app):
+    def __init__(self, parent, app, on_close=None):
         super().__init__(parent)
         self.app = app
+        self._on_close = on_close
         self.title("Types d'intervention")
         self.resizable(False, False)
         self.configure(bg=C["bg"])
         self.geometry("400x460")
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
         tk.Label(self, text="Types d'intervention configurables",
                  bg=C["bg"], font=("Arial",11,"bold"), fg=C["header"]).pack(pady=(14,4))
@@ -4091,8 +5210,13 @@ class TypesDialog(tk.Toplevel):
         bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=10)
         mk_btn(bf, "✏️ Renommer", self._rename).pack(side="left", padx=4)
         mk_btn(bf, "🗑️ Supprimer", self._del, color=C["danger"]).pack(side="left", padx=4)
-        mk_btn(bf, "Fermer", self.destroy, color="#888").pack(side="left", padx=4)
+        mk_btn(bf, "Fermer", self._close, color="#888").pack(side="left", padx=4)
         self._refresh()
+
+    def _close(self):
+        if self._on_close:
+            self._on_close()
+        self.destroy()
 
     def _refresh(self):
         self.lst.delete(0, "end")
@@ -4139,8 +5263,8 @@ class TypesDialog(tk.Toplevel):
 # DIALOG SELECTION PHOTOS POUR ANNEXE
 # ══════════════════════════════════════════════════════════════════════════════
 class PhotosAnnexeDialog(tk.Toplevel):
-    """Popup : choisir les photos du dossier a inclure en annexe du bon.
-    Retourne la liste des chemins coches via le callback on_valider."""
+    """Popup : choisir et ordonner les photos du dossier a inclure en annexe.
+    Retourne la liste ordonnee des chemins coches via le callback on_valider."""
     EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
     def __init__(self, parent, dossier, on_valider):
@@ -4148,16 +5272,22 @@ class PhotosAnnexeDialog(tk.Toplevel):
         self.on_valider = on_valider
         self.dossier = Path(dossier)
         self._vars = {}
+        self._thumbs = []
+        self._thumb_cache = {}
+        self._row_frames = {}   # str(img_path) -> Frame
+        self._order = []        # Path objects dans l'ordre d'affichage
+        self._drag_src = None   # cle de la ligne en cours de glissement
         self.title("Photos à inclure en annexe")
         self.configure(bg=C["bg"])
-        self.geometry("640x560")
+        self.geometry("920x740")
         self.grab_set()
 
         # Lister les images du dossier
-        self._images = sorted(
+        self._order = sorted(
             [f for f in self.dossier.iterdir()
              if f.is_file() and f.suffix.lower() in self.EXTS],
             key=lambda p: p.name.lower()) if self.dossier.is_dir() else []
+        self._load_saved_order()
 
         tk.Label(self, text="📷 Photos disponibles dans le dossier",
                  bg=C["bg"], font=("Arial", 12, "bold"),
@@ -4165,7 +5295,7 @@ class PhotosAnnexeDialog(tk.Toplevel):
         tk.Label(self, text=f"Dossier : {self.dossier.name}",
                  bg=C["bg"], font=("Arial", 9), fg="#666").pack()
 
-        if not self._images:
+        if not self._order:
             tk.Label(self, text="\n(Aucune photo dans ce dossier)\n\n"
                                 "Ajoutez des photos via « Ajouter fichier(s) » "
                                 "puis régénérez le bon.",
@@ -4184,33 +5314,33 @@ class PhotosAnnexeDialog(tk.Toplevel):
                color=C["btn3"]).pack(side="left", padx=3)
         mk_btn(ab, "☐ Tout décocher", lambda: self._toggle_all(False),
                color=C["btn3"]).pack(side="left", padx=3)
+        tk.Label(ab, text="  ↕ Glisser ⠿ pour réordonner",
+                 bg=C["bg"], font=("Arial", 8), fg="#888").pack(side="left", padx=8)
 
         # Zone scrollable avec miniatures
         cont = tk.Frame(self, bg=C["bg"])
         cont.pack(fill="both", expand=True, padx=20, pady=6)
-        canvas = tk.Canvas(cont, bg=C["bg"], highlightthickness=0)
-        vsb = ttk.Scrollbar(cont, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
+        self._canvas = tk.Canvas(cont, bg=C["bg"], highlightthickness=0)
+        vsb = ttk.Scrollbar(cont, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(canvas, bg=C["bg"])
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win, width=e.width))
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._inner = tk.Frame(self._canvas, bg=C["bg"])
+        _win = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>",
+                   lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                    lambda e: self._canvas.itemconfig(_win, width=e.width))
 
         def _wheel(ev):
-            canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
-        canvas.bind("<Enter>",
-                    lambda e: canvas.bind_all("<MouseWheel>", _wheel))
-        canvas.bind("<Leave>",
-                    lambda e: canvas.unbind_all("<MouseWheel>"))
+            self._canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+        self._canvas.bind("<Enter>",
+                    lambda e: self._canvas.bind_all("<MouseWheel>", _wheel))
+        self._canvas.bind("<Leave>",
+                    lambda e: self._canvas.unbind_all("<MouseWheel>"))
 
-        self._vars = {}
-        self._thumbs = []   # garder les references aux PhotoImage
-        for img_path in self._images:
-            self._add_photo_row(inner, img_path)
+        for img_path in self._order:
+            self._add_photo_row(img_path)
 
         # Boutons
         bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=12)
@@ -4218,25 +5348,144 @@ class PhotosAnnexeDialog(tk.Toplevel):
                self._valider, color=C["btn2"]).pack(side="left", padx=6)
         mk_btn(bf, "Annuler", self._annuler, color="#888").pack(side="left", padx=6)
 
-    def _add_photo_row(self, parent, img_path):
-        rf = tk.Frame(parent, bg=C["surface"], relief="solid", bd=1)
+    _PREFS_FILE = ".photos_order.json"
+
+    def _load_saved_order(self):
+        """Restaure l'ordre et les cases cochées depuis le fichier de préférences du bon."""
+        import json as _json
+        pref_file = self.dossier / self._PREFS_FILE
+        if not pref_file.is_file():
+            return
+        try:
+            with open(pref_file, encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception:
+            return
+        saved_order = data.get("order", [])
+        saved_checked = data.get("checked", {})
+        current_by_name = {p.name: p for p in self._order}
+        reordered = []
+        for name in saved_order:
+            if name in current_by_name:
+                reordered.append(current_by_name.pop(name))
+        # Nouvelles images absentes de la sauvegarde ajoutées à la fin
+        for p in self._order:
+            if p.name in current_by_name:
+                reordered.append(p)
+        self._order = reordered
+        for p in self._order:
+            checked = saved_checked.get(p.name, True)
+            self._vars[str(p)] = tk.IntVar(value=1 if checked else 0)
+
+    def _save_order(self):
+        """Sauvegarde l'ordre et les cases cochées dans un fichier caché du dossier bon."""
+        import json as _json, platform as _platform
+        pref_file = self.dossier / self._PREFS_FILE
+        data = {
+            "order": [p.name for p in self._order],
+            "checked": {
+                p.name: bool(self._vars.get(str(p), tk.IntVar(value=1)).get())
+                for p in self._order
+            },
+        }
+        try:
+            with open(pref_file, "w", encoding="utf-8") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+            # Marquer le fichier comme caché sur Windows
+            if _platform.system() == "Windows":
+                import ctypes
+                FILE_ATTRIBUTE_HIDDEN = 0x02
+                ctypes.windll.kernel32.SetFileAttributesW(str(pref_file),
+                                                          FILE_ATTRIBUTE_HIDDEN)
+        except Exception:
+            pass
+
+    def _add_photo_row(self, img_path):
+        key = str(img_path)
+        rf = tk.Frame(self._inner, bg=C["surface"], relief="solid", bd=1)
         rf.pack(fill="x", pady=3, padx=2)
-        var = tk.IntVar(value=1)   # coché par défaut
-        self._vars[str(img_path)] = var
-        tk.Checkbutton(rf, variable=var, bg=C["surface"]).pack(side="left", padx=6)
-        # Miniature
-        thumb = self._make_thumb(img_path)
+        self._row_frames[key] = rf
+
+        # Poignée de glissement
+        handle = tk.Label(rf, text="⠿", font=("Arial", 14), bg=C["surface"],
+                          fg="#aaa", cursor="fleur", padx=4)
+        handle.pack(side="left", padx=2)
+        handle.bind("<Button-1>", lambda e, k=key: self._drag_start(e, k))
+        handle.bind("<B1-Motion>", self._drag_motion)
+        handle.bind("<ButtonRelease-1>", self._drag_end)
+
+        # Case à cocher (conserver l'état si la ligne est recréée)
+        if key not in self._vars:
+            self._vars[key] = tk.IntVar(value=1)
+        tk.Checkbutton(rf, variable=self._vars[key],
+                       bg=C["surface"]).pack(side="left", padx=6)
+
+        # Miniature (avec cache pour éviter de rouvrir le fichier à chaque tri)
+        if key not in self._thumb_cache:
+            self._thumb_cache[key] = self._make_thumb(img_path)
+        thumb = self._thumb_cache[key]
         if thumb:
-            tk.Label(rf, image=thumb, bg=C["surface"]).pack(side="left", padx=6, pady=4)
-            self._thumbs.append(thumb)
+            tk.Label(rf, image=thumb, bg=C["surface"]).pack(side="left", padx=8, pady=6)
+            if thumb not in self._thumbs:
+                self._thumbs.append(thumb)
         else:
-            tk.Label(rf, text="🖼", font=("Arial", 24),
+            tk.Label(rf, text="🖼", font=("Arial", 48),
                      bg=C["surface"]).pack(side="left", padx=14)
-        # Nom
+
+        # Nom du fichier
         tk.Label(rf, text=img_path.name, bg=C["surface"],
                  font=("Arial", 10), anchor="w").pack(side="left", padx=8)
 
-    def _make_thumb(self, img_path, size=64):
+    def _drag_start(self, event, key):
+        self._drag_src = key
+        rf = self._row_frames.get(key)
+        if rf:
+            rf.configure(bg="#cce5ff")
+            for w in rf.winfo_children():
+                try: w.configure(bg="#cce5ff")
+                except Exception: pass
+
+    def _drag_motion(self, event):
+        if not self._drag_src:
+            return
+        abs_y = event.widget.winfo_rooty() + event.y
+        target_key = None
+        for k, rf in self._row_frames.items():
+            ry = rf.winfo_rooty()
+            if ry <= abs_y <= ry + rf.winfo_height():
+                target_key = k
+                break
+        if target_key and target_key != self._drag_src:
+            src_idx = next((i for i, p in enumerate(self._order)
+                            if str(p) == self._drag_src), None)
+            tgt_idx = next((i for i, p in enumerate(self._order)
+                            if str(p) == target_key), None)
+            if src_idx is not None and tgt_idx is not None:
+                item = self._order.pop(src_idx)
+                self._order.insert(tgt_idx, item)
+                self._rebuild_pack_order()
+
+    def _drag_end(self, event):
+        src = self._drag_src
+        self._drag_src = None
+        if src and src in self._row_frames:
+            self._row_frames[src].configure(bg=C["surface"])
+            for w in self._row_frames[src].winfo_children():
+                try: w.configure(bg=C["surface"])
+                except Exception: pass
+
+    def _rebuild_pack_order(self):
+        """Réordonner les frames via pack_forget/pack sans recréer les widgets."""
+        for img_path in self._order:
+            rf = self._row_frames.get(str(img_path))
+            if rf:
+                rf.pack_forget()
+        for img_path in self._order:
+            rf = self._row_frames.get(str(img_path))
+            if rf:
+                rf.pack(fill="x", pady=3, padx=2)
+
+    def _make_thumb(self, img_path, size=160):
         """Tente de creer une miniature. Necessite Pillow ; sinon None."""
         try:
             from PIL import Image, ImageTk
@@ -4260,7 +5509,10 @@ class PhotosAnnexeDialog(tk.Toplevel):
             v.set(1 if value else 0)
 
     def _valider(self):
-        photos = [p for p, v in self._vars.items() if v.get()]
+        self._save_order()
+        # Retourner dans l'ordre d'affichage, seulement les photos cochées
+        photos = [str(p) for p in self._order
+                  if self._vars.get(str(p), tk.IntVar()).get()]
         self.destroy()
         if self.on_valider:
             self.on_valider(photos)
@@ -4285,13 +5537,25 @@ class BonDialog(tk.Toplevel):
         ("duree_garantie",    "Garantie (mois)"),
     ]
     
-    def __init__(self, parent, app, inv_id=None, on_save=None):
+    def __init__(self, parent, app, inv_id=None, on_save=None,
+                 offline_bundle=None, offline_path=None, on_offline_save=None):
         super().__init__(parent)
-        self.app     = app
-        self.inv_id  = inv_id
-        self.on_save = on_save
-        self.is_edit = inv_id is not None
-        self.title("Modifier bon" if self.is_edit else "Nouveau bon d'intervention")
+        self.app              = app
+        self.inv_id           = inv_id
+        self.on_save          = on_save
+        self._offline_bundle  = offline_bundle
+        self._offline_path    = offline_path
+        self._on_offline_save = on_offline_save
+        self.is_offline       = offline_bundle is not None
+        self.is_edit          = (inv_id is not None) or self.is_offline
+
+        if self.is_offline:
+            self.title("Modifier bon — Mode hors-ligne")
+        elif self.is_edit:
+            self.title("Modifier bon")
+        else:
+            self.title("Nouveau bon d'intervention")
+
         self.geometry("980x830")
         try:
             self.state("zoomed")     # plein écran Windows
@@ -4303,9 +5567,15 @@ class BonDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.grab_set()
 
-        self._clients     = list(db.get_clients())
-        self._all_moteurs = list(db.get_moteurs())
-        self._techniciens = list(db.get_techniciens())
+        if self.is_offline:
+            refs = offline_bundle.get("refs", {})
+            self._clients     = refs.get("clients", [])
+            self._all_moteurs = refs.get("moteurs", [])
+            self._techniciens = refs.get("techniciens", [])
+        else:
+            self._clients     = list(db.get_clients())
+            self._all_moteurs = list(db.get_moteurs())
+            self._techniciens = list(db.get_techniciens())
 
         self._client_by_id  = {c["id"]:  c for c in self._clients}
         self._client_by_nom = {c["nom"]: c for c in self._clients}
@@ -4325,6 +5595,16 @@ class BonDialog(tk.Toplevel):
             self.after(50, self._load)
 
     def _build(self):
+        # Bannière hors-ligne
+        if self.is_offline:
+            banner = tk.Frame(self, bg="#4a2800")
+            banner.pack(fill="x")
+            tk.Label(banner,
+                     text="⚠  MODE HORS-LIGNE — Les modifications seront enregistrées "
+                          "localement dans le fichier .ems. Importez en ligne pour synchroniser.",
+                     font=("Arial", 9, "bold"), bg="#4a2800", fg="#ffcc88",
+                     anchor="w").pack(padx=12, pady=5)
+
         canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
@@ -4360,8 +5640,9 @@ class BonDialog(tk.Toplevel):
             values=[c["nom"] for c in self._clients], width=44)
         self.client_combo.pack(side="left")
         self.client_combo.bind("<<ComboboxSelected>>", self._on_client_selected)
-        mk_btn(row, "+", lambda: ClientDialog(self, self.app, on_save=self._reload_refs),
-               color=C["btn2"]).pack(side="left", padx=(8,0))
+        if not self.is_offline:
+            mk_btn(row, "+", lambda: ClientDialog(self, self.app, on_save=self._reload_refs),
+                   color=C["btn2"]).pack(side="left", padx=(8,0))
 
         self.lieu_var       = tk.StringVar()
         self.signataire_var = tk.StringVar()
@@ -4395,6 +5676,14 @@ class BonDialog(tk.Toplevel):
                      width=24, anchor="e").pack(side="left", padx=(0,8))
             cls(r, textvariable=var, width=46).pack(side="left")
 
+        # N° de commande client
+        r = tk.Frame(p, bg=C["bg"])
+        r.pack(fill="x", padx=20, pady=2)
+        tk.Label(r, text="N° commande client", bg=C["bg"], font=("Arial",10),
+                 width=24, anchor="e").pack(side="left", padx=(0,8))
+        self.num_cmd_var = tk.StringVar()
+        ttk.Entry(r, textvariable=self.num_cmd_var, width=46).pack(side="left")
+
         # ── ÉQUIPEMENT ────────────────────────────────────────────────────────
         section_bar(p, "ÉQUIPEMENT")
         row2 = tk.Frame(p, bg=C["bg"])
@@ -4406,8 +5695,9 @@ class BonDialog(tk.Toplevel):
             values=[m["num_serie"] for m in self._all_moteurs], width=44)
         self.moteur_combo.pack(side="left")
         self.moteur_combo.bind("<<ComboboxSelected>>", self._on_moteur_selected)
-        mk_btn(row2, "+", lambda: MoteurDialog(self, self.app, on_save=self._reload_refs),
-               color=C["btn2"]).pack(side="left", padx=(8,0))
+        if not self.is_offline:
+            mk_btn(row2, "+", lambda: MoteurDialog(self, self.app, on_save=self._reload_refs),
+                   color=C["btn2"]).pack(side="left", padx=(8,0))
 
         self._info_lbls = {}
         for key, txt in self.MOTEUR_INFO_FIELDS:
@@ -4425,12 +5715,6 @@ class BonDialog(tk.Toplevel):
                  width=24, anchor="e").pack(side="left", padx=(0,8))
         self.nb_heures_var = tk.StringVar()
         ttk.Entry(rh, textvariable=self.nb_heures_var, width=20).pack(side="left")
-
-        # N° de commande client (champ optionnel, utile pour la facturation)
-        tk.Label(rh, text="  N° commande client", bg=C["bg"], font=("Arial",10)
-            ).pack(side="left", padx=(16, 8))
-        self.num_cmd_var = tk.StringVar()
-        ttk.Entry(rh, textvariable=self.num_cmd_var, width=22).pack(side="left")
 
         rg = tk.Frame(p, bg=C["bg"]); rg.pack(fill="x", padx=20, pady=2)
         tk.Label(rg, text="Garanties du moteur", bg=C["bg"], font=("Arial",10),
@@ -4462,23 +5746,24 @@ class BonDialog(tk.Toplevel):
         r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=4)
         tk.Label(r, text="Type d'intervention *", bg=C["bg"], font=("Arial",10),
                  width=24, anchor="e").pack(side="left", padx=(0,8))
-        ttk.Combobox(r, textvariable=self.type_var, values=db.get_types_intervention(),
-                     width=44, state="readonly").pack(side="left")
-        mk_btn(r, "⚙", lambda: TypesDialog(self, self.app), color=C["btn2"]).pack(side="left", padx=(8,0))
+        if self.is_offline:
+            _types = self._offline_bundle.get("refs", {}).get("types", [])
+        else:
+            try:
+                _types = db.get_types_intervention()
+            except Exception:
+                _types = []
+        self._type_combo = ttk.Combobox(r, textvariable=self.type_var,
+                                        values=_types,
+                                        width=44, state="readonly")
+        self._type_combo.pack(side="left")
+        if not self.is_offline:
+            mk_btn(r, "⚙", lambda: TypesDialog(self, self.app,
+                   on_close=lambda: self._type_combo.config(
+                       values=db.get_types_intervention())),
+                   color=C["btn2"]).pack(side="left", padx=(8,0))
 
-        # Marque moteur
         self.marque_var = tk.StringVar()
-        r_m = tk.Frame(p, bg=C["bg"]); r_m.pack(fill="x", padx=20, pady=4)
-        tk.Label(r_m, text="Marque moteur", bg=C["bg"], font=("Arial",10),
-                 width=24, anchor="e").pack(side="left", padx=(0,8))
-        self.marque_combo = ttk.Combobox(r_m, textvariable=self.marque_var,
-                                          values=db.get_marques(), width=44,
-                                          state="readonly")
-        self.marque_combo.pack(side="left")
-        def _open_marques_dlg():
-            MarquesDialog(self, self.app, on_close=lambda: self.marque_combo.config(
-                values=db.get_marques()))
-        mk_btn(r_m, "⚙", _open_marques_dlg, color=C["btn2"]).pack(side="left", padx=(8,0))
 
         # Urgence
         r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=4)
@@ -4520,7 +5805,7 @@ class BonDialog(tk.Toplevel):
             TechnicienDialog(self, self.app, on_save=on_save_new)
         self.tech_picker = TechniciensPicker(r,
             available=[t["nom"] for t in self._techniciens],
-            on_add_new=_open_new_tech)
+            on_add_new=None if self.is_offline else _open_new_tech)
         self.tech_picker.pack(side="left", fill="x", expand=True)
 
         # Date intervention
@@ -4558,7 +5843,7 @@ class BonDialog(tk.Toplevel):
                        bg=C["bg"], font=("Arial",10)).pack(side="left", padx=(0, 8))
         tk.Checkbutton(op2, text="après", variable=self.chk["memoriser_apres"],
                        bg=C["bg"], font=("Arial",10)).pack(side="left", padx=(0, 24))
-        tk.Label(op2, text="PHOTOS :", bg=C["bg"],
+        tk.Label(op2, text="Photos :", bg=C["bg"],
                  font=("Arial",10,"bold")).pack(side="left", padx=(0, 8))
         tk.Checkbutton(op2, text="avant", variable=self.chk["photos_avant"],
                        bg=C["bg"], font=("Arial",10)).pack(side="left", padx=(0, 8))
@@ -4608,6 +5893,8 @@ class BonDialog(tk.Toplevel):
         section_bar(p, "DÉPLACEMENTS – Temps & frais")
         self.depl_tbl = DeplacementsTable(p)
         self.depl_tbl.pack(fill="x", padx=20, pady=(4, 8))
+        # Sync auto : quand un tech est ajouté/retiré du picker, l'ajouter à tous les jours
+        self.tech_picker._on_change_cb = lambda names: self.depl_tbl.sync_techniciens(names)
 
         # ── DOSSIER ───────────────────────────────────────────────────────────
         section_bar(p, "DOSSIER – FICHIERS & PHOTOS")
@@ -4696,9 +5983,15 @@ class BonDialog(tk.Toplevel):
         # Le picker conserve sa sélection, on recharge juste la liste dispo
         old_techs  = self.tech_picker.get_names()
 
-        self._clients     = list(db.get_clients())
-        self._all_moteurs = list(db.get_moteurs())
-        self._techniciens = list(db.get_techniciens())
+        if self.is_offline:
+            refs = self._offline_bundle.get("refs", {})
+            self._clients     = refs.get("clients", [])
+            self._all_moteurs = refs.get("moteurs", [])
+            self._techniciens = refs.get("techniciens", [])
+        else:
+            self._clients     = list(db.get_clients())
+            self._all_moteurs = list(db.get_moteurs())
+            self._techniciens = list(db.get_techniciens())
         self._client_by_id  = {c["id"]:  c for c in self._clients}
         self._client_by_nom = {c["nom"]: c for c in self._clients}
         self._moteur_by_id  = {m["id"]:  m for m in self._all_moteurs}
@@ -4742,11 +6035,14 @@ class BonDialog(tk.Toplevel):
             e["var"].set("")
             for lw in e["info_lbls"].values():
                 lw.config(text="")
+            if "gar_lbl" in e:
+                e["gar_lbl"].config(text="—", fg="black")
 
     def _on_moteur_selected(self, *_):
         m = self._moteur_by_ns.get(self.moteur_var.get())
         if m:
             self._set_moteur_info(m)
+            self.marque_var.set(row_get(m, "marque", ""))
             if not self.client_var.get():
                 c = self._client_by_id.get(m["client_id"])
                 if c:
@@ -4759,10 +6055,13 @@ class BonDialog(tk.Toplevel):
     def _set_moteur_info(self, m):
         for key, lw in self._info_lbls.items():
             lw.config(text=str(row_get(m, key, "")))
-        # Afficher les garanties RÉELLES saisies dans l'app garanties
-        # pour ce moteur (statut + attribution + N° EMS), au lieu de l'ancien
-        # calcul automatique date de mise en service + durée.
-        gars = db.get_garanties_moteur(row_get(m, "id"))
+        if self.is_offline:
+            gars = []
+        else:
+            try:
+                gars = db.get_garanties_moteur(row_get(m, "id"))
+            except Exception:
+                gars = []
         if not gars:
             self.garantie_lbl.config(
                 text="—  (aucune garantie enregistrée pour ce moteur)",
@@ -4784,7 +6083,7 @@ class BonDialog(tk.Toplevel):
                     fg="#666")
 
     # ─── Moteurs supplémentaires ─────────────────────────────────────────────
-    def _add_moteur_row(self, initial_ns=""):
+    def _add_moteur_row(self, initial_ns="", initial_nb_heures=""):
         # Afficher le container la première fois (avant le lien)
         if not self._extra_moteurs_rows:
             self._extra_moteurs_container.pack(fill="x", padx=20, pady=(2, 0),
@@ -4845,11 +6144,55 @@ class BonDialog(tk.Toplevel):
             lw.pack(side="left", ipady=2)
             entry["info_lbls"][key] = lw
 
+        # Nb heures de fonctionnement (saisie manuelle)
+        r_h = tk.Frame(bloc, bg=C["bg"])
+        r_h.pack(fill="x", pady=1)
+        tk.Label(r_h, text="Nb heures de fonctionnement", bg=C["bg"], font=("Arial", 9),
+                 width=24, anchor="e").pack(side="left", padx=(0, 8))
+        nb_h_var = tk.StringVar(value=initial_nb_heures)
+        ttk.Entry(r_h, textvariable=nb_h_var, width=20).pack(side="left")
+        entry["nb_heures_var"] = nb_h_var
+
+        # Garanties du moteur
+        r_g = tk.Frame(bloc, bg=C["bg"])
+        r_g.pack(fill="x", pady=1)
+        tk.Label(r_g, text="Garanties du moteur", bg=C["bg"], font=("Arial", 9),
+                 width=24, anchor="e").pack(side="left", padx=(0, 8))
+        gar_lbl = tk.Label(r_g, text="—", bg="#eef2f7", font=("Arial", 9),
+                           anchor="w", relief="groove", padx=6, justify="left")
+        gar_lbl.pack(side="left", fill="x", expand=True, ipady=2)
+        entry["gar_lbl"] = gar_lbl
+
         # Peuplement auto des infos à la sélection
         def _on_sel(*_, e=entry):
             m = self._moteur_by_ns.get(e["var"].get().strip())
             for key, lw in e["info_lbls"].items():
                 lw.config(text=str(row_get(m, key, "") if m else ""))
+            # Garanties
+            lbl = e["gar_lbl"]
+            if not m:
+                lbl.config(text="—", fg="black")
+                return
+            if self.is_offline:
+                gars = []
+            else:
+                try:
+                    gars = db.get_garanties_moteur(row_get(m, "id"))
+                except Exception:
+                    gars = []
+            if not gars:
+                lbl.config(text="—  (aucune garantie enregistrée pour ce moteur)", fg="#666")
+            else:
+                ouvertes = [g for g in gars if g["statut"] != "Clôturée"]
+                if ouvertes:
+                    parts = [f"{g['num_ems']} · {g['attribution']} · {g['statut']}"
+                             for g in ouvertes[:3]]
+                    txt = "🛡 " + "   |   ".join(parts)
+                    if len(ouvertes) > 3:
+                        txt += f"   (+{len(ouvertes) - 3} autre(s))"
+                    lbl.config(text=txt, fg="#0f5132")
+                else:
+                    lbl.config(text=f"🛡 {len(gars)} garantie(s) — toutes clôturées", fg="#666")
 
         combo.bind("<<ComboboxSelected>>", _on_sel)
 
@@ -4859,7 +6202,7 @@ class BonDialog(tk.Toplevel):
 
     # ─── Fichiers ─────────────────────────────────────────────────────────────
     def _current_dossier(self):
-        if not self.is_edit or not self.inv_id:
+        if self.is_offline or not self.is_edit or not self.inv_id:
             return None
         inv = db.get_intervention(inv_id=self.inv_id)
         if not inv: return None
@@ -4969,6 +6312,12 @@ class BonDialog(tk.Toplevel):
 
     # ─── Signature client ─────────────────────────────────────────────────────
     def _faire_signer(self):
+        if self.is_offline:
+            SignatureDialog(self, self.app,
+                            offline_bundle=self._offline_bundle,
+                            offline_path=self._offline_path,
+                            on_offline_save=self._reload_apres_signature)
+            return
         if not self.is_edit or not self.inv_id:
             messagebox.showinfo(
                 "Enregistrer d'abord",
@@ -4987,6 +6336,11 @@ class BonDialog(tk.Toplevel):
 
     # ─── Notifications ────────────────────────────────────────────────────────
     def _mail_client_inline(self):
+        if self.is_offline:
+            messagebox.showwarning("Hors ligne",
+                "L'envoi d'email n'est pas disponible en mode hors-ligne.\n"
+                "Importez le bon en ligne pour utiliser cette fonction.")
+            return
         if not self.is_edit:
             messagebox.showinfo("Sauvegarde requise",
                 "Enregistrez d'abord le bon avant de notifier le client.")
@@ -5001,14 +6355,31 @@ class BonDialog(tk.Toplevel):
             messagebox.showwarning("Email manquant",
                 "Aucun email renseigné (demandeur, signataire ou client).")
             return
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_client(inv, client, moteur, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_client(inv, client, moteur, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
         db.mark_notifie(self.inv_id, "client")
 
     def _mail_tech_inline(self):
+        if self.is_offline:
+            messagebox.showwarning("Hors ligne",
+                "L'envoi d'email n'est pas disponible en mode hors-ligne.\n"
+                "Importez le bon en ligne pour utiliser cette fonction.")
+            return
         if not self.is_edit:
             messagebox.showinfo("Sauvegarde requise",
                 "Enregistrez d'abord le bon avant de notifier le technicien.")
@@ -5024,14 +6395,31 @@ class BonDialog(tk.Toplevel):
             em = row_get(t, "email")
             if em:
                 emails.append(em)
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_technicien(inv, client, moteur, emails, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_technicien(inv, client, moteur, emails, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
         db.mark_notifie(self.inv_id, "tech")
 
     def _mail_cloture_inline(self):
+        if self.is_offline:
+            messagebox.showwarning("Hors ligne",
+                "L'envoi d'email n'est pas disponible en mode hors-ligne.\n"
+                "Importez le bon en ligne pour utiliser cette fonction.")
+            return
         if not self.is_edit:
             messagebox.showinfo("Sauvegarde requise",
                 "Enregistrez d'abord le bon avant d'envoyer le mail de clôture.")
@@ -5049,16 +6437,33 @@ class BonDialog(tk.Toplevel):
             em = row_get(t, "email")
             if em:
                 tech_emails.append(em)
-        try:
-            path = sauvegarder_bon(inv, generer_pdf=True)
-        except (PermissionError, RuntimeError) as exc:
-            messagebox.showerror("PDF impossible", str(exc)); return
-        mailer.email_cloture(inv, client, moteur, tech_emails, str(path))
+        num_bon = row_get(inv, "num_bon")
+        _d = _dossiers_root() / num_bon
+        _pdf = _d / f"{num_bon}.pdf"
+        _html = _d / f"{num_bon}.html"
+        if _pdf.exists():
+            path = _pdf
+        elif _html.exists():
+            path = _html
+        else:
+            try:
+                path = sauvegarder_bon(inv, generer_pdf=True)
+            except (PermissionError, RuntimeError) as exc:
+                messagebox.showerror("PDF impossible", str(exc)); return
+        _, pj_auto = mailer.email_cloture(inv, client, moteur, tech_emails, str(path))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le bon manuellement depuis le dossier qui vient de s'ouvrir :\n{Path(path).parent}")
 
     # ─── Chargement ───────────────────────────────────────────────────────────
     def _load(self):
-        inv = db.get_intervention(inv_id=self.inv_id)
-        if not inv: return
+        if self.is_offline:
+            from shared import import_export as ie
+            inv = ie.get_data(self._offline_bundle)
+        else:
+            inv = db.get_intervention(inv_id=self.inv_id)
+            if not inv:
+                return
 
         c = self._client_by_id.get(row_get(inv, "client_id"))
         if c:
@@ -5136,7 +6541,8 @@ class BonDialog(tk.Toplevel):
         except (json.JSONDecodeError, TypeError):
             extra_ms = []
         for em in extra_ms:
-            self._add_moteur_row(initial_ns=em.get("num_serie", ""))
+            self._add_moteur_row(initial_ns=em.get("num_serie", ""),
+                                 initial_nb_heures=em.get("nb_heures_fct", ""))
 
         self._refresh_files()
 
@@ -5293,14 +6699,25 @@ class BonDialog(tk.Toplevel):
             "deplacements_json": json.dumps(deplacements, ensure_ascii=False),
             "moteurs_supplementaires_json": json.dumps(
                 [
-                    {k: row_get(m, k) for k in ("id","num_serie","navire","machine",
-                                                  "type_moteur","marque","ref_constructeur",
-                                                  "date_mise_service","duree_garantie")}
+                    {
+                        **{k: row_get(m, k) for k in ("id","num_serie","navire","machine",
+                                                       "type_moteur","marque","ref_constructeur",
+                                                       "date_mise_service","duree_garantie")},
+                        "nb_heures_fct": e.get("nb_heures_var", tk.StringVar()).get().strip(),
+                    }
                     for e in self._extra_moteurs_rows
                     if (m := self._moteur_by_ns.get(e["var"].get().strip()))  # noqa: E231
                 ],
                 ensure_ascii=False),
         }
+
+        if self.is_offline:
+            if self._on_offline_save:
+                self._on_offline_save(data)
+            messagebox.showinfo("Enregistré hors-ligne",
+                "✅ Les modifications ont été enregistrées dans le fichier .ems.\n\n"
+                "Importez le fichier en ligne pour synchroniser avec le serveur.")
+            return
 
         if self.is_edit:
             db.update_intervention(self.inv_id, data)
@@ -5351,7 +6768,7 @@ class ImportCSVDialog(tk.Toplevel):
     - options de dédoublonnage
     """
 
-    # Libellés français pour les champs DB
+    # Libellés français pour les champs DB — mapping fixe affiché par défaut
     FIELD_LABELS = [
         ("nom_client",       "Nom client (Tiers) *"),
         ("type_client",      "Type Client"),
@@ -5369,6 +6786,13 @@ class ImportCSVDialog(tk.Toplevel):
         ("code_affaire",     "Code Affaire"),
     ]
 
+    # Champs ajoutables manuellement via le bouton "+"
+    EXTRA_FIELD_LABELS = [
+        ("date_mise_service", "Date de mise en service"),
+        ("duree_garantie",    "Durée de garantie (mois)"),
+        ("machine",           "Machine (type)"),
+    ]
+
     def __init__(self, parent, app, on_save=None):
         super().__init__(parent)
         self.app = app
@@ -5378,14 +6802,16 @@ class ImportCSVDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.grab_set()
 
-        self.csv_path     = None
-        self.headers      = []
-        self.preview_rows = []
-        self.total_lines  = 0
-        self.mapping      = {}
-        self.delimiter    = ";"
-        self.encoding     = "utf-8"
-        self.column_vars  = {}  # field → StringVar (header sélectionné)
+        self.csv_path        = None
+        self.headers         = []
+        self.preview_rows    = []
+        self.total_lines     = 0
+        self.mapping         = {}
+        self.delimiter       = ";"
+        self.encoding        = "utf-8"
+        self.column_vars     = {}   # field → StringVar (header sélectionné)
+        self._extra_rows_data = []  # [{"field": str, "col_var": StringVar, "frame": Frame}]
+        self._extra_cont     = None
 
         # Boutons EN BAS d'abord (sinon poussés hors fenêtre)
         bf = tk.Frame(self, bg=C["bg"])
@@ -5458,13 +6884,14 @@ class ImportCSVDialog(tk.Toplevel):
             messagebox.showwarning("Fichier vide", "Le fichier ne contient pas d'en-têtes.")
             return
 
-        self.csv_path     = path
-        self.headers      = hd
-        self.preview_rows = prev
-        self.total_lines  = total
-        self.mapping      = mapping
-        self.delimiter    = delim
-        self.encoding     = enc
+        self.csv_path         = path
+        self.headers          = hd
+        self.preview_rows     = prev
+        self.total_lines      = total
+        self.mapping          = mapping
+        self.delimiter        = delim
+        self.encoding         = enc
+        self._extra_rows_data = []
 
         self.file_lbl.config(
             text=f"📄 {Path(path).name} – {total} ligne(s), {len(hd)} colonne(s) – "
@@ -5510,6 +6937,19 @@ class ImportCSVDialog(tk.Toplevel):
             ttk.Combobox(row, textvariable=var, values=choices,
                          width=42, state="readonly").pack(side="left", fill="x", expand=True)
 
+        # ── Liaisons supplémentaires ─────────────────────────────────────────
+        tk.Frame(inner, bg="#c0c8d0", height=1).pack(fill="x", padx=4, pady=(12, 4))
+        hdr_extra = tk.Frame(inner, bg=C["bg"])
+        hdr_extra.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Label(hdr_extra, text="Liaisons supplémentaires",
+                 bg=C["bg"], font=("Arial", 9, "bold"), fg="#002b5c").pack(side="left")
+        mk_btn(hdr_extra, "+ Ajouter",
+               lambda c=choices: self._open_extra_field_picker(c),
+               color=C["btn2"]).pack(side="left", padx=8)
+
+        self._extra_cont = tk.Frame(inner, bg=C["bg"])
+        self._extra_cont.pack(fill="x")
+
     def _render_preview_tab(self):
         for w in self.preview_tab.winfo_children():
             w.destroy()
@@ -5534,6 +6974,59 @@ class ImportCSVDialog(tk.Toplevel):
         fill_tree(tree, [tuple(r + [""] * (len(self.headers) - len(r)))
                           for r in self.preview_rows])
 
+    def _open_extra_field_picker(self, choices):
+        """Popup pour choisir un champ supplémentaire à mapper."""
+        used = {r["field"] for r in self._extra_rows_data}
+        available = [(k, lbl) for k, lbl in self.EXTRA_FIELD_LABELS if k not in used]
+        if not available:
+            messagebox.showinfo("Aucun champ disponible",
+                                "Tous les champs supplémentaires ont déjà été ajoutés.")
+            return
+        labels = [lbl for _, lbl in available]
+        keys   = [k   for k, _ in available]
+        dlg = tk.Toplevel(self)
+        dlg.title("Ajouter un champ")
+        dlg.geometry("380x130")
+        dlg.configure(bg=C["bg"])
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        tk.Label(dlg, text="Champ moteur à ajouter :",
+                 bg=C["bg"], font=("Arial", 10)).pack(pady=(14, 6), padx=20, anchor="w")
+        var = tk.StringVar(value=labels[0])
+        ttk.Combobox(dlg, textvariable=var, values=labels,
+                     state="readonly", width=38).pack(padx=20)
+        bf = tk.Frame(dlg, bg=C["bg"])
+        bf.pack(pady=10)
+        def _confirm():
+            idx = labels.index(var.get())
+            self._add_extra_row(keys[idx], labels[idx], choices)
+            dlg.destroy()
+        mk_btn(bf, "Ajouter", _confirm, color=C["btn2"]).pack(side="left", padx=6)
+        mk_btn(bf, "Annuler", dlg.destroy, color="#888").pack(side="left", padx=6)
+
+    def _add_extra_row(self, field_key, field_label, choices):
+        """Ajoute une ligne de liaison supplémentaire dans _extra_cont."""
+        col_var = tk.StringVar(value="(ignorer)")
+        # Auto-détection si le champ figure dans le mapping détecté
+        idx = self.mapping.get(field_key)
+        if idx is not None and idx < len(self.headers):
+            col_var.set(self.headers[idx])
+
+        row_f = tk.Frame(self._extra_cont, bg=C["bg"])
+        row_f.pack(fill="x", padx=4, pady=2)
+        tk.Label(row_f, text=field_label, bg=C["bg"], font=("Arial", 10),
+                 anchor="e", width=28).pack(side="left", padx=(0, 8))
+        ttk.Combobox(row_f, textvariable=col_var, values=choices,
+                     width=38, state="readonly").pack(side="left", fill="x", expand=True)
+
+        row_data = {"field": field_key, "col_var": col_var, "frame": row_f}
+        self._extra_rows_data.append(row_data)
+
+        def _remove():
+            self._extra_rows_data.remove(row_data)
+            row_f.destroy()
+        mk_btn(row_f, "✕", _remove, color=C["danger"]).pack(side="left", padx=(6, 0))
+
     def _build_mapping_from_ui(self):
         """Reconstruit le dict mapping à partir des combos utilisateur."""
         mapping = {}
@@ -5543,6 +7036,12 @@ class ImportCSVDialog(tk.Toplevel):
                 mapping[field] = None
             else:
                 mapping[field] = self.headers.index(h)
+        for row_data in self._extra_rows_data:
+            h = row_data["col_var"].get()
+            if h == "(ignorer)" or h not in self.headers:
+                mapping[row_data["field"]] = None
+            else:
+                mapping[row_data["field"]] = self.headers.index(h)
         return mapping
 
     def _simulate(self):
@@ -5722,17 +7221,27 @@ class SignatureDialog(tk.Toplevel):
     À la validation finale, les deux signatures sont enregistrées et
     la fenêtre se ferme automatiquement.
     """
-    def __init__(self, parent, app, inv_id, on_save=None):
+    def __init__(self, parent, app, inv_id=None, on_save=None,
+                 offline_bundle=None, offline_path=None, on_offline_save=None):
         super().__init__(parent)
         self.app = app
         self.inv_id = inv_id
         self.on_save = on_save
+        self._offline_bundle = offline_bundle
+        self._offline_path = offline_path
+        self._on_offline_save = on_offline_save
+        self.is_offline = offline_bundle is not None
 
-        self.inv = db.get_intervention(inv_id=inv_id)
-        if not self.inv:
-            messagebox.showerror("Erreur", "Intervention introuvable.")
-            self.destroy()
-            return
+        if self.is_offline:
+            orig  = offline_bundle.get("intervention", {})
+            edits = offline_bundle.get("offline_edits") or {}
+            self.inv = {**orig, **edits}
+        else:
+            self.inv = db.get_intervention(inv_id=inv_id)
+            if not self.inv:
+                messagebox.showerror("Erreur", "Intervention introuvable.")
+                self.destroy()
+                return
 
         # Données accumulées entre les étapes
         self._client_b64 = None
@@ -5754,63 +7263,74 @@ class SignatureDialog(tk.Toplevel):
         self.grab_set()
         self.bind("<Escape>", lambda _e: self._annuler())
 
-        # ── Récapitulatif (commun aux 2 étapes) ──────────────────────────
-        mk_header(self, "Validation de l'intervention",
-                  "   Vérifiez le récapitulatif puis signez ci-dessous")
+        # Résolution écran — stockée pour dimensionner tout le dialog
+        try:
+            self._sh = self.winfo_screenheight()
+            self._sw = self.winfo_screenwidth()
+        except tk.TclError:
+            self._sh, self._sw = 900, 1600
+
+        # ── Header compact et responsive ─────────────────────────────────
+        hdr_h    = 36 if self._sh < 900 else (48 if self._sh < 1080 else 58)
+        hdr_fsz  = 11 if self._sh < 900 else (13 if self._sh < 1080 else 15)
+        bar = tk.Frame(self, bg=C["header"], height=hdr_h)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Frame(bar, bg=C["accent"], width=4).pack(side="left", fill="y")
+        tk.Label(bar, text="Validation de l'intervention",
+                 font=("Segoe UI", hdr_fsz, "bold"),
+                 bg=C["header"], fg="white", padx=20).pack(side="left")
 
         self._recap_widget()
+
+        # ── Boutons (re-créés à chaque étape) — packés en premier pour rester visibles ──
+        self.bf = tk.Frame(self, bg=C["bg"])
+        self.bf.pack(side="bottom", pady=(6, 16))
+
+        # ── Indicateur d'étape ──────────────────────────────────────────
+        self.steps_bar = tk.Frame(self, bg=C["bg"])
+        self.steps_bar.pack(side="bottom", fill="x", padx=24, pady=(0, 4))
+        self._maj_indicateur()
 
         # ── Zone d'étape (remplacée à chaque étape) ──────────────────────
         self.zone = tk.Frame(self, bg=C["bg"])
         self.zone.pack(fill="both", expand=True, padx=24, pady=4)
 
-        # ── Indicateur d'étape ──────────────────────────────────────────
-        self.steps_bar = tk.Frame(self, bg=C["bg"])
-        self.steps_bar.pack(fill="x", padx=24, pady=(0, 4))
-        self._maj_indicateur()
-
-        # ── Boutons (re-créés à chaque étape) ────────────────────────────
-        self.bf = tk.Frame(self, bg=C["bg"])
-        self.bf.pack(side="bottom", pady=(6, 16))
-
         self._afficher_etape_client()
 
     # ── Récapitulatif ─────────────────────────────────────────────────────
     def _recap_widget(self):
-        client = db.get_client(self.inv["client_id"]) if self.inv["client_id"] else None
-        moteur = db.get_moteur(self.inv["moteur_id"]) if self.inv["moteur_id"] else None
+        sh = self._sh
+        if self.is_offline:
+            client_nom = row_get(self.inv, "client_nom") or ""
+            client = {"nom": client_nom} if client_nom else None
+            moteur = self.inv
+        else:
+            client = db.get_client(self.inv["client_id"]) if self.inv["client_id"] else None
+            moteur = db.get_moteur(self.inv["moteur_id"]) if self.inv["moteur_id"] else None
+
+        font_sz = 8  if sh < 800  else (9  if sh < 1000 else 10)
+        pad_y   = (2, 1) if sh < 800 else ((4, 2) if sh < 1000 else (6, 3))
+        cell_px = 8  if sh < 800  else (12 if sh < 1000 else 18)
+
         recap = tk.Frame(self, bg=C["surface"], bd=1, relief="solid")
-        recap.pack(fill="x", padx=24, pady=(12, 4))
+        recap.pack(fill="x", padx=24, pady=pad_y)
         lignes = [
             ("N° de bon", self.inv["num_bon"]),
-            ("Date", self.inv["date_creation"]),
             ("Client", (client["nom"] if client else "") or "—"),
             ("Navire / Site", row_get(moteur, "navire") or
                               row_get(self.inv, "lieu_intervention") or "—"),
-            ("Moteur", row_get(moteur, "num_serie") or "—"),
-            ("Type", self.inv["type_intervention"] or "—"),
-            ("Technicien", self.inv["technicien"] or "—"),
         ]
-        grid = tk.Frame(recap, bg=C["surface"])
-        grid.pack(fill="x", padx=16, pady=10)
-        for i, (lbl, val) in enumerate(lignes):
-            r, c = divmod(i, 4)
-            cell = tk.Frame(grid, bg=C["surface"])
-            cell.grid(row=r, column=c, sticky="w", padx=14, pady=3)
+        row_frame = tk.Frame(recap, bg=C["surface"])
+        row_frame.pack(fill="x", padx=cell_px, pady=pad_y)
+        for lbl, val in lignes:
+            cell = tk.Frame(row_frame, bg=C["surface"])
+            cell.pack(side="left", padx=cell_px)
             tk.Label(cell, text=lbl + " : ", bg=C["surface"],
                      fg=C["text_muted"],
-                     font=("Segoe UI", 9, "bold")).pack(side="left")
+                     font=("Segoe UI", font_sz, "bold")).pack(side="left")
             tk.Label(cell, text=str(val), bg=C["surface"], fg=C["text"],
-                     font=("Segoe UI", 9)).pack(side="left")
-        travaux = (row_get(self.inv, "travaux") or
-                   row_get(self.inv, "description") or "").strip()
-        if travaux:
-            tk.Label(recap, text="Travaux : " + travaux[:280] +
-                     ("…" if len(travaux) > 280 else ""),
-                     bg=C["surface"], fg=C["text"],
-                     font=("Segoe UI", 9), justify="left",
-                     wraplength=1000, anchor="w").pack(
-                fill="x", padx=16, pady=(0, 10))
+                     font=("Segoe UI", font_sz)).pack(side="left")
         # Priorité au nom du signataire saisi sur le bon, sinon nom du client
         self._client_nom_defaut = (row_get(self.inv, "nom_signataire") or
                                    (client["nom"] if client else "") or "")
@@ -5828,9 +7348,11 @@ class SignatureDialog(tk.Toplevel):
                 bg, fg, prefix = C["header"], "white", "▶ "
             else:
                 bg, fg, prefix = C["bg_alt"], C["text_muted"], "  "
+            fsz = 8 if self._sh < 800 else (9 if self._sh < 1000 else 10)
+            pxy = 3 if self._sh < 800 else (4 if self._sh < 1000 else 5)
             tk.Label(self.steps_bar, text=prefix + libelle,
-                     bg=bg, fg=fg, font=("Segoe UI", 10, "bold"),
-                     padx=14, pady=5).pack(side="left", padx=4)
+                     bg=bg, fg=fg, font=("Segoe UI", fsz, "bold"),
+                     padx=10, pady=pxy).pack(side="left", padx=2)
 
     # ── ÉTAPE 1 : CLIENT ─────────────────────────────────────────────────
     def _afficher_etape_client(self):
@@ -5841,13 +7363,23 @@ class SignatureDialog(tk.Toplevel):
         for w in self.bf.winfo_children():
             w.destroy()
 
+        sh = self._sh
+        t_fsz  = 11 if sh < 800 else (12 if sh < 1000 else 14)
+        b_fsz  = 9  if sh < 800 else 10
+        py_t   = (3, 1) if sh < 800 else ((5, 1) if sh < 1000 else (8, 2))
+        py_sub = (0, 2) if sh < 800 else ((0, 3) if sh < 1000 else (0, 4))
+        py_chk = (0, 3) if sh < 800 else ((0, 4) if sh < 1000 else (0, 6))
+        py_nf  = (4, 2) if sh < 800 else ((6, 3) if sh < 1000 else (10, 4))
+        py_acc = 2 if sh < 800 else 4
+
         tk.Label(self.zone, text="✍  SIGNATURE CLIENT",
                  bg=C["bg"], fg=C["header"],
-                 font=("Segoe UI", 14, "bold")).pack(pady=(8, 2))
-        tk.Label(self.zone,
-                 text="À faire signer au client (au doigt sur la tablette)",
-                 bg=C["bg"], fg=C["text_muted"],
-                 font=("Segoe UI", 10)).pack(pady=(0, 4))
+                 font=("Segoe UI", t_fsz, "bold")).pack(pady=py_t)
+        if sh >= 800:
+            tk.Label(self.zone,
+                     text="À faire signer au client (au doigt sur la tablette)",
+                     bg=C["bg"], fg=C["text_muted"],
+                     font=("Segoe UI", b_fsz)).pack(pady=py_sub)
 
         # ── Case "client absent" ──────────────────────────────────────────
         self.client_absent_var = tk.IntVar(value=0)
@@ -5855,37 +7387,31 @@ class SignatureDialog(tk.Toplevel):
             self.zone,
             text="  Client absent — passer directement à la signature technicien",
             variable=self.client_absent_var,
-            bg=C["bg"], fg=C["warn"], font=("Segoe UI", 11, "bold"),
+            bg=C["bg"], fg=C["warn"], font=("Segoe UI", b_fsz, "bold"),
             activebackground=C["bg"], selectcolor="white",
             command=self._toggle_client_absent)
-        self._absent_chk.pack(pady=(0, 6))
+        self._absent_chk.pack(pady=py_chk)
 
         # Badge affiché quand client absent est coché
         self._absent_badge = tk.Label(self.zone, text="⚠  CLIENT ABSENT — signature ignorée",
                                        bg="#fff3cd", fg="#856404",
-                                       font=("Segoe UI", 12, "bold"), padx=12, pady=6,
+                                       font=("Segoe UI", b_fsz + 1, "bold"), padx=10, pady=4,
                                        relief="solid", bd=1)
         # (non packé par défaut — apparaît via _toggle_client_absent)
 
-        # Taille adaptée à la fenêtre plein écran (tablette)
-        try:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-        except tk.TclError:
-            sw, sh = 1600, 900
-        pad_w = max(800, min(sw - 200, 1600))
-        pad_h = max(280, min(sh - 480, 480))
+        pad_w = max(800, min(self._sw - 200, 1600))
+        pad_h = max(180, min(sh - 560, 400))
         self.pad_client = _SignaturePad(self.zone, width=pad_w, height=pad_h,
                                          titre="", sous_titre="")
         self.pad_client.pack()
 
         nf = tk.Frame(self.zone, bg=C["bg"])
-        nf.pack(pady=(10, 4))
+        nf.pack(pady=py_nf)
         tk.Label(nf, text="Nom du signataire * : ", bg=C["bg"],
-                 font=("Segoe UI", 11), fg=C["text"]).pack(side="left")
+                 font=("Segoe UI", b_fsz), fg=C["text"]).pack(side="left")
         self.nom_client_var = tk.StringVar(value=self._client_nom_defaut)
         self._nom_client_entry = ttk.Entry(nf, textvariable=self.nom_client_var,
-                                            width=40, font=("Segoe UI", 12))
+                                            width=40, font=("Segoe UI", b_fsz + 1))
         self._nom_client_entry.pack(side="left")
 
         self.accept_var = tk.IntVar(value=0)
@@ -5894,9 +7420,9 @@ class SignatureDialog(tk.Toplevel):
             text=" Le client reconnaît avoir pris connaissance de "
                  "l'intervention et en accepte la réalisation.",
             variable=self.accept_var, bg=C["bg"], fg=C["text"],
-            font=("Segoe UI", 10), activebackground=C["bg"],
+            font=("Segoe UI", b_fsz), activebackground=C["bg"],
             selectcolor="white", anchor="w")
-        self._accept_chk.pack(pady=4)
+        self._accept_chk.pack(pady=py_acc)
 
         self._btn_effacer_client = mk_btn(self.bf, "🧹 Effacer",
                                            self.pad_client.effacer,
@@ -5965,39 +7491,43 @@ class SignatureDialog(tk.Toplevel):
         for w in self.bf.winfo_children():
             w.destroy()
 
+        sh = self._sh
+        t_fsz = 11 if sh < 800 else (12 if sh < 1000 else 14)
+        b_fsz = 9  if sh < 800 else 10
+        py_t  = (3, 1) if sh < 800 else ((5, 1) if sh < 1000 else (8, 2))
+        py_sub = (0, 4) if sh < 800 else (0, 8)
+        py_nf  = (4, 2) if sh < 800 else ((6, 3) if sh < 1000 else (10, 4))
+
         tk.Label(self.zone, text="✍  SIGNATURE TECHNICIEN EMS",
                  bg=C["bg"], fg=C["header"],
-                 font=("Segoe UI", 14, "bold")).pack(pady=(8, 2))
-        tk.Label(self.zone,
-                 text="Le technicien atteste la réalisation des travaux",
-                 bg=C["bg"], fg=C["text_muted"],
-                 font=("Segoe UI", 10)).pack(pady=(0, 8))
+                 font=("Segoe UI", t_fsz, "bold")).pack(pady=py_t)
+        if sh >= 800:
+            tk.Label(self.zone,
+                     text="Le technicien atteste la réalisation des travaux",
+                     bg=C["bg"], fg=C["text_muted"],
+                     font=("Segoe UI", b_fsz)).pack(pady=py_sub)
 
-        try:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-        except tk.TclError:
-            sw, sh = 1600, 900
-        pad_w = max(800, min(sw - 200, 1600))
-        pad_h = max(280, min(sh - 480, 480))
+        pad_w = max(800, min(self._sw - 200, 1600))
+        pad_h = max(180, min(sh - 560, 400))
         self.pad_tech = _SignaturePad(self.zone, width=pad_w, height=pad_h,
                                        titre="", sous_titre="")
         self.pad_tech.pack()
 
         nf = tk.Frame(self.zone, bg=C["bg"])
-        nf.pack(pady=(10, 4))
+        nf.pack(pady=py_nf)
         tk.Label(nf, text="Nom du technicien * : ", bg=C["bg"],
-                 font=("Segoe UI", 11), fg=C["text"]).pack(side="left")
+                 font=("Segoe UI", b_fsz), fg=C["text"]).pack(side="left")
         self.nom_tech_var = tk.StringVar(
             value=row_get(self.inv, "technicien") or "")
         ttk.Entry(nf, textvariable=self.nom_tech_var, width=40,
-                  font=("Segoe UI", 12)).pack(side="left")
+                  font=("Segoe UI", b_fsz + 1)).pack(side="left")
 
-        tk.Label(self.zone,
-                 text=" J'atteste sur l'honneur la réalisation des travaux "
-                      "décrits ci-dessus.",
-                 bg=C["bg"], fg=C["text_muted"],
-                 font=("Segoe UI", 10, "italic")).pack(pady=4)
+        if sh >= 800:
+            tk.Label(self.zone,
+                     text=" J'atteste sur l'honneur la réalisation des travaux "
+                          "décrits ci-dessus.",
+                     bg=C["bg"], fg=C["text_muted"],
+                     font=("Segoe UI", b_fsz, "italic")).pack(pady=2)
 
         mk_btn(self.bf, "◂ Retour", self._afficher_etape_client,
                color=C["btn3"]).pack(side="left", padx=8)
@@ -6033,7 +7563,52 @@ class SignatureDialog(tk.Toplevel):
         self._tech_b64 = b64
         self._tech_nom = nom
 
-        # Enregistrement des 2 signatures + régénération bon
+        # ── Mode hors-ligne : enregistrement dans le bundle .ems ─────────────
+        if self.is_offline:
+            from shared import import_export as ie
+            from datetime import datetime as _dt
+            edits = dict(ie.get_data(self._offline_bundle))
+            now = _dt.now().strftime("%Y-%m-%d %H:%M")
+            edits["signature_b64"] = self._client_b64 or ""
+            edits["signature_nom"] = self._client_nom or ""
+            edits["signature_date"] = now if self._client_b64 else ""
+            edits["signature_tech_b64"] = self._tech_b64
+            edits["signature_tech_nom"] = self._tech_nom
+            edits["signature_tech_date"] = now
+            try:
+                ie.apply_offline_edits(self._offline_bundle, edits,
+                                       self._offline_path)
+            except Exception as e:
+                self._msg("showerror", "Erreur d'enregistrement",
+                          f"Impossible de sauvegarder les signatures :\n{e}")
+                return
+            if self._client_b64:
+                self._sauver_png(self._client_b64, "signature_client.png")
+            self._sauver_png(self._tech_b64, "signature_technicien.png")
+            if self._on_offline_save:
+                try:
+                    self._on_offline_save()
+                except Exception as e_cb:
+                    print(f"[Signature] on_offline_save erreur : {e_cb}")
+            try:
+                self.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+            msg = ("✅ Signatures enregistrées hors-ligne.\n\n"
+                   "Elles seront transmises au serveur lors de l'import.")
+            parent = self.master
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
+            try:
+                messagebox.showinfo("Signatures enregistrées", msg,
+                                    parent=parent)
+            except tk.TclError:
+                messagebox.showinfo("Signatures enregistrées", msg)
+            return
+
+        # ── Mode en ligne : enregistrement via API + régénération bon ────────
         try:
             h_c = db.enregistrer_signature(
                 self.inv_id, self._client_b64, self._client_nom,
