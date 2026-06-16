@@ -4804,6 +4804,17 @@ class MoteurDialog(tk.Toplevel):
         ("client_utilisateur_adresse", "Adresse utilisateur"),
     ]
 
+    # Champs hérités du moteur principal à la création d'un sous-ensemble :
+    # uniquement le contexte d'installation / client final. Un sous-ensemble
+    # est un équipement à part entière (ex : l'inverseur d'un moteur), donc
+    # sa marque/type/référence/cylindrée etc. ne sont PAS préremplis.
+    INHERITED_FIELDS = {
+        "navire", "machine", "code_affaire", "type_client",
+        "date_mise_service", "duree_garantie",
+        "client_utilisateur_nom", "client_utilisateur_email",
+        "client_utilisateur_tel", "client_utilisateur_adresse",
+    }
+
     def __init__(self, parent, app, moteur=None, on_save=None, parent_moteur=None):
         """parent_moteur : moteur principal, fourni uniquement à la création
         d'un sous-ensemble (mêmes champs qu'un moteur, rattaché via
@@ -4850,7 +4861,7 @@ class MoteurDialog(tk.Toplevel):
         def _default(key):
             if moteur:
                 return moteur.get(key, "")
-            if parent_moteur and key != "num_serie":
+            if parent_moteur and key in self.INHERITED_FIELDS:
                 return parent_moteur.get(key, "")
             return ""
         self.v = {k: tk.StringVar(value=_default(k)) for k, _ in self.FIELDS}
