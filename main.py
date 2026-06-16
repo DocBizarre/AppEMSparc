@@ -192,8 +192,11 @@ def mk_btn(parent, text, cmd, color=None, hover=None, **kw):
     return btn
 
 
-def mk_tree(parent, cols, col_defs, height=18):
-    """col_defs : liste de tuples (cid, lbl, width, [anchor])."""
+def mk_tree(parent, cols, col_defs, height=18, show_tree=False):
+    """col_defs : liste de tuples (cid, lbl, width, [anchor]).
+    show_tree=True : conserve la colonne arborescence (#0) avec les flèches
+    ▶/▼ d'expansion, pour les vues avec hiérarchie parent/enfant.
+    """
     # Container avec bordure douce
     wrapper = tk.Frame(parent, bg=C["border"], bd=0)
     frame = tk.Frame(wrapper, bg=C["surface"])
@@ -201,9 +204,13 @@ def mk_tree(parent, cols, col_defs, height=18):
 
     vsb = ttk.Scrollbar(frame, orient="vertical")
     hsb = ttk.Scrollbar(frame, orient="horizontal")
-    tree = ttk.Treeview(frame, columns=cols, show="headings",
+    tree = ttk.Treeview(frame, columns=cols,
+                        show=("tree headings" if show_tree else "headings"),
                         height=height, yscrollcommand=vsb.set, xscrollcommand=hsb.set,
                         style="EMS.Treeview")
+    if show_tree:
+        tree.column("#0", width=26, minwidth=26, stretch=False, anchor="center")
+        tree.heading("#0", text="")
     vsb.config(command=tree.yview)
     hsb.config(command=tree.xview)
     vsb.pack(side="right", fill="y")
@@ -2293,13 +2300,15 @@ class MoteursFrame(tk.Frame):
                     ("machine","Machine",100),
                     ("type_moteur","Type moteur",115),("date","Mise en service",105),
                     ("garantie","Mois",50, "center"),("statut_g","Garantie",115)]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=22)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=22, show_tree=True)
         tf.pack(fill="both", expand=True, padx=20, pady=4)
 
         af = tk.Frame(self, bg=C["bg"])
         af.pack(fill="x", padx=20, pady=8)
         mk_btn(af, "✏️ Modifier", self._modifier).pack(side="left", padx=4)
         mk_btn(af, "📋 Fiche & historique", self._voir_inv).pack(side="left", padx=4)
+        mk_btn(af, "➕ Sous-ensemble", self._se_add,
+               color=C["btn2"]).pack(side="left", padx=4)
         self.btn_suppr = mk_btn(af, "🗑️ Supprimer",
                                  self._supprimer, color=C["danger"])
         self.btn_suppr.pack(side="left", padx=4)
@@ -2308,49 +2317,61 @@ class MoteursFrame(tk.Frame):
         self.sel_info.pack(side="left", padx=(12, 0))
         self.tree.bind("<Double-1>", lambda e: self._modifier())
         self.tree.bind("<<TreeviewSelect>>", self._on_select_change)
+        self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self._cache = []
+        self._by_id = {}
+        self._loaded_children = set()
 
-        # ── Panneau sous-ensembles (collapsible) ──────────────────────────
-        self._se_open = False
-        self._se_moteur = None
-        self._se_cache = []
+    def _row_values(self, m):
+        statut, jours = db.garantie_status(m.get("date_mise_service", ""),
+                                            m.get("duree_garantie", ""))
+        if statut == "Active":   gtxt = f"Active · {jours}j"
+        elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
+        else: gtxt = "—"
+        return (m.get("num_serie", ""), m.get("client_nom", "") or "",
+                row_get(m, "navire"), row_get(m, "marque"), row_get(m, "machine"),
+                row_get(m, "type_moteur"), m.get("date_mise_service", ""),
+                m.get("duree_garantie", ""), gtxt)
 
-        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(4, 0))
+    def refresh(self):
+        ms = db.get_moteurs(search=self.search_var.get(),
+                             serie_only=bool(self.serie_only_var.get()))
+        self._cache = list(ms)
+        self._by_id = {m["id"]: m for m in self._cache}
+        self._loaded_children = set()
+        self.tree.delete(*self.tree.get_children())
+        for i, m in enumerate(self._cache):
+            tags = ["even" if i % 2 == 0 else "odd"]
+            self.tree.insert("", "end", iid=m["id"],
+                              values=self._row_values(m), tags=tags)
+            if m.get("nb_sous_ensembles", 0) > 0:
+                # Nœud factice : juste pour afficher la flèche ▶, remplacé
+                # par les vrais sous-ensembles au premier déploiement.
+                self.tree.insert(m["id"], "end",
+                                  values=("⏳ chargement…", "", "", "", "", "", "", "", ""))
 
-        se_hdr = tk.Frame(self, bg=C["bg"])
-        se_hdr.pack(fill="x", padx=20)
-        self._se_toggle_btn = tk.Button(
-            se_hdr, text="▶  Sous-ensembles",
-            bg=C["bg"], fg=C["text_muted"],
-            font=F["small"], relief="flat", bd=0,
-            anchor="w", cursor="hand2",
-            command=self._toggle_se_panel,
-        )
-        self._se_toggle_btn.pack(side="left", pady=4)
-        self._se_count_lbl = tk.Label(
-            se_hdr, text="", bg=C["bg"],
-            fg=C["text_muted"], font=F["small"])
-        self._se_count_lbl.pack(side="left", padx=(4, 0))
+    def _on_tree_open(self, _ev=None):
+        iid = self.tree.focus()
+        if iid in self._by_id and iid not in self._loaded_children:
+            self._load_children(iid)
 
-        self._se_panel = tk.Frame(self, bg=C["bg"])
-        cols_se = ("libelle", "reference", "marque", "num_serie", "etat")
-        col_defs_se = [
-            ("libelle",   "Libellé",   200),
-            ("reference", "Référence", 120),
-            ("marque",    "Marque",     90),
-            ("num_serie", "N° Série",  140),
-            ("etat",      "État",       90),
-        ]
-        se_tf, self._se_tree = mk_tree(self._se_panel, cols_se, col_defs_se, height=5)
-        se_tf.pack(fill="x", padx=0, pady=(4, 0))
-        se_af = tk.Frame(self._se_panel, bg=C["bg"])
-        se_af.pack(fill="x", pady=4)
-        mk_btn(se_af, "➕ Ajouter sous-ensemble", self._se_add).pack(side="left", padx=4)
-        mk_btn(se_af, "✏️ Modifier", self._se_edit,
-               color=C["btn2"]).pack(side="left", padx=4)
-        mk_btn(se_af, "🗑️ Supprimer", self._se_del,
-               color=C["danger"]).pack(side="left", padx=4)
-        self._se_tree.bind("<Double-1>", lambda _: self._se_edit())
+    def _load_children(self, parent_id):
+        self._loaded_children.add(parent_id)
+        self.tree.delete(*self.tree.get_children(parent_id))
+        try:
+            children = list(db.get_sous_ensembles(parent_id))
+        except Exception as e:
+            children = []
+            print(f"[MoteursFrame] sous-ensembles : {e}")
+        if not children:
+            self.tree.insert(parent_id, "end",
+                              values=("(aucun sous-ensemble)", "", "", "", "", "", "", "", ""))
+            return
+        for j, se in enumerate(children):
+            self._by_id[se["id"]] = se
+            tags = ["even" if j % 2 == 0 else "odd"]
+            self.tree.insert(parent_id, "end", iid=se["id"],
+                              values=self._row_values(se), tags=tags)
 
     def _on_select_change(self, _ev=None):
         sel = self.tree.selection()
@@ -2360,139 +2381,38 @@ class MoteursFrame(tk.Frame):
             self.btn_suppr.config(text="🗑️ Supprimer")
         else:
             self.sel_info.config(
-                text=f"{n} moteurs sélectionnés "
+                text=f"{n} éléments sélectionnés "
                      "(Ctrl/Maj-clic pour ajuster)")
             self.btn_suppr.config(text=f"🗑️ Supprimer ({n})")
-        # Mise à jour panneau sous-ensembles
-        if sel:
-            m = self._cache[int(sel[0])]
-            self._se_moteur = m
-            nb = m.get("nb_sous_ensembles", 0)
-            if nb:
-                self._se_count_lbl.config(
-                    text=f"({nb} sous-ensemble{'s' if nb > 1 else ''})",
-                    fg=C["header"])
-                self._se_toggle_btn.config(fg=C["header"])
-            else:
-                self._se_count_lbl.config(text="(aucun)", fg=C["text_muted"])
-                self._se_toggle_btn.config(fg=C["text_muted"])
-            if self._se_open:
-                self._load_se()
-        else:
-            self._se_moteur = None
-            self._se_count_lbl.config(text="", fg=C["text_muted"])
-            self._se_toggle_btn.config(fg=C["text_muted"])
-
-    def _toggle_se_panel(self):
-        if not self._se_moteur:
-            return
-        self._se_open = not self._se_open
-        arrow = "▼" if self._se_open else "▶"
-        self._se_toggle_btn.config(text=f"{arrow}  Sous-ensembles")
-        if self._se_open:
-            self._se_panel.pack(fill="x", padx=20, pady=(0, 8))
-            self._load_se()
-        else:
-            self._se_panel.pack_forget()
-
-    def _load_se(self):
-        if not self._se_moteur:
-            return
-        try:
-            self._se_cache = list(db.get_sous_ensembles(self._se_moteur["id"]))
-        except Exception as e:
-            self._se_cache = []
-            print(f"[MoteursFrame] sous-ensembles : {e}")
-        self._se_tree.delete(*self._se_tree.get_children())
-        if not self._se_cache:
-            self._se_tree.insert("", "end",
-                                 values=("(aucun sous-ensemble)", "", "", "", ""))
-        else:
-            for i, se in enumerate(self._se_cache):
-                tags = ("even" if i % 2 == 0 else "odd",)
-                self._se_tree.insert("", "end", iid=str(i),
-                    values=(se.get("libelle", ""),
-                            se.get("reference", ""),
-                            se.get("marque", ""),
-                            se.get("num_serie", ""),
-                            se.get("etat", "")),
-                    tags=tags)
-        # Mettre à jour le compteur
-        nb = len(self._se_cache)
-        if nb:
-            self._se_count_lbl.config(
-                text=f"({nb} sous-ensemble{'s' if nb > 1 else ''})",
-                fg=C["header"])
-        else:
-            self._se_count_lbl.config(text="(aucun)", fg=C["text_muted"])
 
     def _se_add(self):
-        if not self._se_moteur:
-            messagebox.showwarning("Sélection", "Sélectionnez un moteur d'abord.")
+        r = self._sel()
+        if not r:
+            return
+        if r.get("parent_moteur_id"):
+            messagebox.showwarning(
+                "Sous-ensemble",
+                "Impossible d'ajouter un sous-ensemble à un sous-ensemble.\n"
+                "Sélectionnez un moteur principal.")
             return
         def _after_save():
-            self._load_se()
             self.refresh()
-        SousEnsembleDialog(self, self.app, dict(self._se_moteur), on_save=_after_save)
-
-    def _se_edit(self):
-        sel = self._se_tree.selection()
-        if not sel:
-            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.")
-            return
-        idx = int(sel[0])
-        if idx >= len(self._se_cache):
-            return
-        SousEnsembleDialog(self, self.app, dict(self._se_moteur),
-                           se=dict(self._se_cache[idx]),
-                           on_save=self._load_se)
-
-    def _se_del(self):
-        sel = self._se_tree.selection()
-        if not sel:
-            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.")
-            return
-        idx = int(sel[0])
-        if idx >= len(self._se_cache):
-            return
-        se = self._se_cache[idx]
-        if not messagebox.askyesno("Supprimer",
-                f"Supprimer le sous-ensemble « {se.get('libelle', '')} » ?"):
-            return
-        try:
-            db.delete_sous_ensemble(self._se_moteur["id"], se["id"])
-            self._load_se()
-            self.refresh()
-        except Exception as e:
-            messagebox.showerror("Erreur", str(e))
-
-    def refresh(self):
-        ms = db.get_moteurs(search=self.search_var.get(),
-                             serie_only=bool(self.serie_only_var.get()))
-        self._cache = list(ms)
-        rows = []
-        for m in self._cache:
-            statut, jours = db.garantie_status(m["date_mise_service"], m["duree_garantie"])
-            if statut == "Active":   gtxt = f"Active · {jours}j"
-            elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
-            else: gtxt = "—"
-            rows.append((m["num_serie"], m["client_nom"] or "",
-                         row_get(m, "navire"),
-                         row_get(m, "marque"),
-                         row_get(m, "machine"),
-                         row_get(m, "type_moteur"),
-                         m["date_mise_service"], m["duree_garantie"], gtxt))
-        fill_tree(self.tree, rows)
+            if self.tree.exists(r["id"]):
+                self.tree.item(r["id"], open=True)
+                self._load_children(r["id"])
+        MoteurDialog(self, self.app, parent_moteur=r, on_save=_after_save)
 
     def _sel(self):
-        """Premier moteur sélectionné (compat avec actions unitaires)."""
+        """Premier élément sélectionné (moteur ou sous-ensemble)."""
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("Sélection","Sélectionnez un moteur."); return None
-        return self._cache[int(sel[0])]
+        return self._by_id.get(sel[0])
 
     def _sel_multi(self):
-        """Liste des moteurs sélectionnés (Ctrl/Shift click pris en charge)."""
+        """Liste des éléments sélectionnés (Ctrl/Shift click pris en charge).
+        Si un moteur et l'un de ses sous-ensembles sont sélectionnés en même
+        temps, seul le moteur est conservé (la suppression cascade)."""
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning(
@@ -2500,7 +2420,9 @@ class MoteursFrame(tk.Frame):
                 "Sélectionnez un ou plusieurs moteurs.\n"
                 "(Ctrl-clic ou Maj-clic pour en sélectionner plusieurs)")
             return []
-        return [self._cache[int(s)] for s in sel]
+        items = [self._by_id[s] for s in sel if s in self._by_id]
+        ids = {m["id"] for m in items}
+        return [m for m in items if m.get("parent_moteur_id") not in ids]
 
     def _modifier(self):
         r = self._sel()
@@ -4691,16 +4613,17 @@ class MoteurFicheDialog(tk.Toplevel):
         self.tree_gar.bind("<Double-1>", lambda _: self._ouvrir_dossier_gar())
 
         # --- Onglet Sous-ensembles ---
+        # Un sous-ensemble est un Moteur comme un autre (mêmes champs),
+        # rattaché à ce moteur via parent_moteur_id.
         tab_se = tk.Frame(nb, bg=C["bg"])
         nb.add(tab_se, text="  Sous-ensembles  ")
-        cols3 = ("libelle", "reference", "marque", "num_serie", "etat", "notes")
+        cols3 = ("num_serie", "marque", "machine", "type_moteur", "date")
         col_defs3 = [
-            ("libelle",   "Libellé",    200),
-            ("reference", "Référence",  110),
-            ("marque",    "Marque",      90),
-            ("num_serie", "N° Série",   120),
-            ("etat",      "État",        85),
-            ("notes",     "Notes",      160),
+            ("num_serie",   "N° Série",         120),
+            ("marque",      "Marque",            90),
+            ("machine",     "Machine",          110),
+            ("type_moteur", "Type moteur",      130),
+            ("date",        "Mise en service",  110),
         ]
         tf3, self.tree_se = mk_tree(tab_se, cols3, col_defs3, height=9)
         tf3.pack(fill="both", expand=True, padx=8, pady=(6, 2))
@@ -4764,22 +4687,21 @@ class MoteurFicheDialog(tk.Toplevel):
         self.tree_se.delete(*self.tree_se.get_children())
         if not self._se_cache:
             self.tree_se.insert("", "end",
-                                values=("(aucun sous-ensemble)", "", "", "", "", ""))
+                                values=("(aucun sous-ensemble)", "", "", "", ""))
         else:
             for i, se in enumerate(self._se_cache):
                 tags = ("even" if i % 2 == 0 else "odd",)
                 self.tree_se.insert("", "end", iid=f"se_{i}",
-                    values=(se.get("libelle", ""),
-                            se.get("reference", ""),
+                    values=(se.get("num_serie", ""),
                             se.get("marque", ""),
-                            se.get("num_serie", ""),
-                            se.get("etat", ""),
-                            se.get("notes", "")),
+                            se.get("machine", ""),
+                            se.get("type_moteur", ""),
+                            se.get("date_mise_service", "")),
                     tags=tags)
 
     def _se_add(self):
-        SousEnsembleDialog(self, self.app, dict(self.moteur),
-                           on_save=self._charger)
+        MoteurDialog(self, self.app, parent_moteur=dict(self.moteur),
+                     on_save=self._charger)
 
     def _se_edit(self):
         sel = self.tree_se.selection()
@@ -4789,9 +4711,8 @@ class MoteurFicheDialog(tk.Toplevel):
         idx = int(sel[0].replace("se_", ""))
         if idx >= len(self._se_cache):
             return
-        SousEnsembleDialog(self, self.app, dict(self.moteur),
-                           se=dict(self._se_cache[idx]),
-                           on_save=self._charger)
+        MoteurDialog(self, self.app, moteur=dict(self._se_cache[idx]),
+                     on_save=self._charger)
 
     def _se_del(self):
         sel = self.tree_se.selection()
@@ -4803,11 +4724,11 @@ class MoteurFicheDialog(tk.Toplevel):
             return
         se = self._se_cache[idx]
         if not messagebox.askyesno("Supprimer",
-                f"Supprimer le sous-ensemble « {se.get('libelle', '')} » ?\n\n"
+                f"Supprimer le sous-ensemble « {se.get('num_serie', '')} » ?\n\n"
                 "Cette action est irréversible.", parent=self):
             return
         try:
-            db.delete_sous_ensemble(self.moteur["id"], se["id"])
+            db.delete_moteur(se["id"])
             self._charger()
         except Exception as e:
             messagebox.showerror("Erreur", str(e), parent=self)
@@ -4883,18 +4804,39 @@ class MoteurDialog(tk.Toplevel):
         ("client_utilisateur_adresse", "Adresse utilisateur"),
     ]
 
-    def __init__(self, parent, app, moteur=None, on_save=None):
+    def __init__(self, parent, app, moteur=None, on_save=None, parent_moteur=None):
+        """parent_moteur : moteur principal, fourni uniquement à la création
+        d'un sous-ensemble (mêmes champs qu'un moteur, rattaché via
+        parent_moteur_id). Sert aussi à préremplir les champs partagés
+        (client, navire, machine, marque…) pour gagner du temps de saisie."""
         super().__init__(parent)
         self.app = app; self.moteur = moteur; self.on_save = on_save
-        self.title("Nouveau moteur" if not moteur else f"Modifier – {moteur['num_serie']}")
+        self.parent_moteur = parent_moteur
+        if moteur:
+            titre = f"Modifier – {moteur['num_serie']}"
+        elif parent_moteur:
+            titre = f"Nouveau sous-ensemble — Moteur {parent_moteur.get('num_serie', '')}"
+        else:
+            titre = "Nouveau moteur"
+        self.title(titre)
         self.resizable(False, False)
         self.configure(bg=C["bg"])
         self.grab_set()
         self._clients = list(db.get_clients())
         self.client_var = tk.StringVar()
-        if moteur and moteur.get("client_id"):
-            c = next((x for x in self._clients if x["id"]==moteur["client_id"]),None)
+        client_src = moteur or parent_moteur
+        if client_src and client_src.get("client_id"):
+            c = next((x for x in self._clients if x["id"]==client_src["client_id"]),None)
             if c: self.client_var.set(c["nom"])
+        if parent_moteur and not moteur:
+            ctx = tk.Frame(self, bg=C["surface"], relief="solid", bd=1)
+            ctx.pack(fill="x", padx=24, pady=(14, 0))
+            tk.Label(ctx,
+                     text=f"Sous-ensemble du moteur {parent_moteur.get('num_serie', '—')} "
+                          f"({parent_moteur.get('marque', '') or '—'} — "
+                          f"{parent_moteur.get('navire', '') or '—'})",
+                     bg=C["surface"], font=("Arial", 9, "bold"),
+                     fg=C["header"]).pack(anchor="w", padx=10, pady=6)
         f = tk.Frame(self, bg=C["bg"])
         f.pack(padx=24, pady=18)
         tk.Label(f, text="Client *", bg=C["bg"], font=("Arial",10),
@@ -4904,8 +4846,14 @@ class MoteurDialog(tk.Toplevel):
             values=[c["nom"] for c in self._clients],
             width=33)
         self._client_combo.grid(row=0, column=1, pady=4, sticky="w")
-        self.v = {k: tk.StringVar(value=(moteur.get(k,"") if moteur else ""))
-                  for k, _ in self.FIELDS}
+
+        def _default(key):
+            if moteur:
+                return moteur.get(key, "")
+            if parent_moteur and key != "num_serie":
+                return parent_moteur.get(key, "")
+            return ""
+        self.v = {k: tk.StringVar(value=_default(k)) for k, _ in self.FIELDS}
         self._marque_combo = None
         for i,(key,lbl) in enumerate(self.FIELDS, start=1):
             tk.Label(f, text=lbl, bg=C["bg"], font=("Arial",10),
@@ -4946,110 +4894,13 @@ class MoteurDialog(tk.Toplevel):
                 f"Date de mise en service invalide : '{d_svc}'\nFormat attendu : JJ/MM/AAAA")
             return
         client = next((c for c in self._clients if c["nom"]==cn),None)
-        db.upsert_moteur({"client_id":client["id"] if client else "",
-                          **{k:self.v[k].get().strip() for k in self.v}},
-                         moteur_id=self.moteur["id"] if self.moteur else None)
+        data = {"client_id":client["id"] if client else "",
+                **{k:self.v[k].get().strip() for k in self.v}}
+        if self.parent_moteur and not self.moteur:
+            data["parent_moteur_id"] = self.parent_moteur["id"]
+        db.upsert_moteur(data, moteur_id=self.moteur["id"] if self.moteur else None)
         if self.on_save: self.on_save()
         self.destroy()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DIALOG SOUS-ENSEMBLE
-# ══════════════════════════════════════════════════════════════════════════════
-class SousEnsembleDialog(tk.Toplevel):
-    """Ajouter ou modifier un sous-ensemble rattaché à un moteur.
-    Les infos communes du moteur (marque, navire, machine) sont préremplies.
-    """
-    ETATS = ["Neuf", "Bon état", "Usagé", "Hors service"]
-
-    def __init__(self, parent, app, moteur, se=None, on_save=None):
-        super().__init__(parent)
-        self.app = app
-        self.moteur = moteur
-        self.se = se
-        self.on_save = on_save
-        ns = moteur.get("num_serie", "")
-        titre = "Nouveau sous-ensemble" if not se else f"Modifier – {se.get('libelle', '')}"
-        self.title(f"{titre} — Moteur {ns}")
-        self.resizable(False, False)
-        self.configure(bg=C["bg"])
-        self.grab_set()
-
-        # ── Bandeau contexte moteur (lecture seule) ────────────────────────
-        ctx = tk.Frame(self, bg=C["surface"], relief="solid", bd=1)
-        ctx.pack(fill="x", padx=20, pady=(14, 0))
-        tk.Label(ctx, text="Moteur associé", bg=C["surface"],
-                 font=("Arial", 9, "bold"), fg=C["header"]).pack(anchor="w", padx=10, pady=(6, 2))
-        ctx_items = [
-            ("N° Série",    moteur.get("num_serie", "—")),
-            ("Marque",      moteur.get("marque", "—")),
-            ("Navire/Site", moteur.get("navire", "—") or "—"),
-            ("Machine",     moteur.get("machine", "—") or "—"),
-            ("Client",      moteur.get("client_nom", "—") or "—"),
-        ]
-        row_ctx = tk.Frame(ctx, bg=C["surface"])
-        row_ctx.pack(fill="x", padx=10, pady=(0, 8))
-        for lbl, val in ctx_items:
-            cell = tk.Frame(row_ctx, bg=C["surface"])
-            cell.pack(side="left", padx=(0, 18))
-            tk.Label(cell, text=f"{lbl} :", bg=C["surface"],
-                     font=("Arial", 8, "bold"), fg="#888").pack(side="left")
-            tk.Label(cell, text=val, bg=C["surface"],
-                     font=("Arial", 8), fg="#1a2332").pack(side="left", padx=(3, 0))
-
-        # ── Champs du sous-ensemble ────────────────────────────────────────
-        f = tk.Frame(self, bg=C["bg"])
-        f.pack(padx=24, pady=14)
-
-        fields = [
-            ("libelle",    "Libellé *",            False),
-            ("reference",  "Référence",             False),
-            ("marque",     "Marque",                False),
-            ("num_serie",  "N° Série sous-ensemble",False),
-            ("etat",       "État",                  True),
-            ("notes",      "Notes",                 False),
-        ]
-        self._vars = {}
-        for i, (key, lbl, is_combo) in enumerate(fields):
-            if key == "marque":
-                default = (se.get("marque", "") if se else "") or moteur.get("marque", "")
-            elif key == "etat":
-                default = (se.get("etat", "") if se else "") or "Neuf"
-            else:
-                default = se.get(key, "") if se else ""
-            var = tk.StringVar(value=default)
-            self._vars[key] = var
-            tk.Label(f, text=lbl, bg=C["bg"], font=("Arial", 10),
-                     anchor="e", width=24).grid(row=i, column=0, sticky="e",
-                                                padx=(0, 6), pady=4)
-            if is_combo:
-                ttk.Combobox(f, textvariable=var, values=self.ETATS,
-                             state="readonly", width=32).grid(row=i, column=1, pady=4)
-            else:
-                ttk.Entry(f, textvariable=var, width=34).grid(row=i, column=1, pady=4)
-
-        bf = tk.Frame(self, bg=C["bg"])
-        bf.pack(pady=12)
-        mk_btn(bf, "💾 Enregistrer", self._save).pack(side="left", padx=8)
-        mk_btn(bf, "Annuler", self.destroy, color="#888").pack(side="left", padx=8)
-
-    def _save(self):
-        libelle = self._vars["libelle"].get().strip()
-        if not libelle:
-            messagebox.showwarning("Champ requis", "Le libellé est obligatoire.", parent=self)
-            return
-        data = {k: self._vars[k].get().strip() for k in self._vars}
-        try:
-            mid = self.moteur["id"]
-            if self.se:
-                db.update_sous_ensemble(mid, self.se["id"], data)
-            else:
-                db.create_sous_ensemble(mid, data)
-            if self.on_save:
-                self.on_save()
-            self.destroy()
-        except Exception as e:
-            messagebox.showerror("Erreur", str(e), parent=self)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
