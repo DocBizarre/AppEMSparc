@@ -71,6 +71,17 @@ def _dossiers_root() -> Path:
     return p
 
 
+def _dossiers_root_garanties() -> Path:
+    """Dossier racine des fiches de garantie (même logique que garantie_generator)."""
+    try:
+        from garantie_generator import _get_garanties_root
+        return _get_garanties_root()
+    except Exception:
+        p = Path(__file__).resolve().parent / "garanties"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
 # ─── Palette ──────────────────────────────────────────────────────────────────
 C = {
     # ─── Fonds ────────────────────────────────────────────────────────────────
@@ -100,6 +111,8 @@ C = {
     "row_even":   "#f7f9fc",   # bandes très discrètes
     "row_odd":    "#ffffff",
     "row_hover":  "#e3eaf3",
+    "se_row_even": "#dce6f6",  # sous-ensembles — fond pair (bleu EMS atténué)
+    "se_row_odd":  "#e8f0fb",  # sous-ensembles — fond impair
     "border":     "#d8dee5",   # bordures douces
     # ─── États / urgence ──────────────────────────────────────────────────────
     "urg_normale":  "#6b7785",
@@ -113,8 +126,10 @@ C = {
     "fact_bg":      "#eff6ff",
     "clos":         "#10b981",  # Clos - vert
     "clos_bg":      "#ecfdf5",
+    "prog":         "#0ea5e9",  # Date à programmer - bleu ciel
+    "prog_bg":      "#e0f2fe",
 }
-STATUTS  = ["En cours", "À facturer", "Facturé", "Clos"]
+STATUTS  = ["En cours", "Date à programmer", "À facturer", "Facturé", "Clos"]
 URGENCES = ["Normale", "Urgente", "Critique"]
 
 # Polices unifiées (Tkinter accepte des tuples ou un nom de famille)
@@ -192,7 +207,7 @@ def mk_btn(parent, text, cmd, color=None, hover=None, **kw):
     return btn
 
 
-def mk_tree(parent, cols, col_defs, height=18, show_tree=False):
+def mk_tree(parent, cols, col_defs, height=18, show_tree=False, show_hsb=True):
     """col_defs : liste de tuples (cid, lbl, width, [anchor]).
     show_tree=True : conserve la colonne arborescence (#0) avec les flèches
     ▶/▼ d'expansion, pour les vues avec hiérarchie parent/enfant.
@@ -203,18 +218,20 @@ def mk_tree(parent, cols, col_defs, height=18, show_tree=False):
     frame.pack(fill="both", expand=True, padx=1, pady=1)
 
     vsb = ttk.Scrollbar(frame, orient="vertical")
-    hsb = ttk.Scrollbar(frame, orient="horizontal")
     tree = ttk.Treeview(frame, columns=cols,
                         show=("tree headings" if show_tree else "headings"),
-                        height=height, yscrollcommand=vsb.set, xscrollcommand=hsb.set,
+                        height=height, yscrollcommand=vsb.set,
                         style="EMS.Treeview")
+    if show_hsb:
+        hsb = ttk.Scrollbar(frame, orient="horizontal")
+        hsb.config(command=tree.xview)
+        tree.configure(xscrollcommand=hsb.set)
+        hsb.pack(side="bottom", fill="x")
     if show_tree:
         tree.column("#0", width=26, minwidth=26, stretch=False, anchor="center")
         tree.heading("#0", text="")
     vsb.config(command=tree.yview)
-    hsb.config(command=tree.xview)
     vsb.pack(side="right", fill="y")
-    hsb.pack(side="bottom", fill="x")
     tree.pack(fill="both", expand=True)
 
     # Tags pour urgence (fond + couleur de texte)
@@ -222,6 +239,9 @@ def mk_tree(parent, cols, col_defs, height=18, show_tree=False):
     tree.tag_configure("odd",  background=C["row_odd"])
     tree.tag_configure("urg_critique", background="#fef2f2", foreground=C["urg_critique"])
     tree.tag_configure("urg_urgente",  background="#fff7ed", foreground=C["urg_urgente"])
+    if show_tree:
+        tree.tag_configure("se_even", background=C["se_row_even"])
+        tree.tag_configure("se_odd",  background=C["se_row_odd"])
 
     for cd in col_defs:
         if len(cd) == 4:
@@ -470,15 +490,18 @@ class SearchableCombobox(tk.Frame):
       .configure(foreground=...)
     """
     def __init__(self, master, textvariable=None, values=None, width=44,
-                 case_sensitive=False, max_visible=8, **kw):
+                 case_sensitive=False, max_visible=8, allow_free_text=False,
+                 min_chars_to_open=0, **kw):
         for k in ("state", "values", "textvariable", "validate", "validatecommand"):
             kw.pop(k, None)
         super().__init__(master, bg=master.cget("bg") if "bg" not in kw else kw.get("bg"))
 
-        self._all_values     = list(values or [])
-        self._filtered       = list(self._all_values)
-        self._case_sensitive = case_sensitive
-        self._max_visible    = max_visible
+        self._all_values      = list(values or [])
+        self._filtered        = list(self._all_values)
+        self._case_sensitive  = case_sensitive
+        self._max_visible     = max_visible
+        self._allow_free_text = allow_free_text
+        self._min_chars_to_open = min_chars_to_open
         self.var             = textvariable or tk.StringVar()
         self._suppress_trace = False
         self._is_open        = False
@@ -597,7 +620,8 @@ class SearchableCombobox(tk.Frame):
             return
         query = self.var.get()
         self._filtered = self._filter(query)
-        if query:
+        enough = len(query) >= max(1, self._min_chars_to_open)
+        if enough and (self._filtered or not self._allow_free_text):
             self._open_dropdown()
             self._refresh_listbox()
         else:
@@ -655,10 +679,10 @@ class SearchableCombobox(tk.Frame):
         except (tk.TclError, AttributeError):
             pass
         self._close_dropdown()
-        # Coloration informative si valeur hors liste
+        # Coloration informative si valeur hors liste (uniquement pour les champs à sélection obligatoire)
         v = self.var.get().strip()
         try:
-            if v and v not in self._all_values:
+            if v and v not in self._all_values and not self._allow_free_text:
                 self.entry.configure(foreground=C["warn"])
             else:
                 self.entry.configure(foreground="black")
@@ -702,7 +726,11 @@ class SearchableCombobox(tk.Frame):
         if self._is_open:
             self._close_dropdown()
         else:
-            self._filtered = self._filter(self.var.get())
+            q = self.var.get()
+            if self._min_chars_to_open and len(q) < self._min_chars_to_open:
+                self.entry.focus_set()
+                return
+            self._filtered = self._filter(q)
             self._open_dropdown()
             self._refresh_listbox()
             self.entry.focus_set()
@@ -1336,20 +1364,23 @@ class AppEMS(tk.Tk):
 
 # Catalogue des widgets disponibles
 WIDGET_CATALOG = [
-    ("stats_cards",        "📊 Cartes statistiques",    "Cartes synthétiques (En cours, Clos, etc.)"),
-    ("urgentes",           "⚡ Interventions urgentes", "Liste des bons Urgente / Critique en cours"),
-    ("activite_recente",   "🕒 Activité récente",        "Derniers bons modifiés"),
-    ("garantie_expirante", "⏰ Garanties expirantes",    "Moteurs dont la garantie expire bientôt"),
-    ("par_technicien",     "🛠️ Charge par technicien",   "Nombre d'interventions par technicien"),
-    ("par_type",           "🔧 Répartition par type",    "Statistiques par type d'intervention"),
-    ("non_notifies",       "📧 Non notifiés",            "Bons en cours sans notification envoyée"),
-    ("classifications",    "🏷️ Par classification",     "Garantie / Facturable / Interne"),
+    ("stats_cards",        "Cartes statistiques",    "Cartes synthétiques (En cours, Clos, etc.)"),
+    ("urgentes",           "Interventions urgentes", "Liste des bons Urgente / Critique en cours"),
+    ("a_programmer",       "Bons à programmer",      "Liste des bons au statut 'Date à programmer'"),
+    ("a_facturer",         "Bons à facturer",         "Liste des bons au statut 'À facturer'"),
+    ("activite_recente",   "Activité récente",        "Derniers bons modifiés"),
+    ("garantie_expirante", "Garanties expirantes",    "Moteurs dont la garantie expire bientôt"),
+    ("par_technicien",     "Charge par technicien",   "Nombre d'interventions par technicien"),
+    ("par_type",           "Répartition par type",    "Statistiques par type d'intervention"),
+    ("non_notifies",       "Non notifiés",            "Bons en cours sans notification envoyée"),
+    ("classifications",    "Par classification",      "Garantie / Facturable / Interne"),
 ]
 
 # Catalogue des cartes statistiques
 CARD_CATALOG = [
     # (clé, label affiché, couleur d'accent latéral, couleur du chiffre)
     ("En cours",     "En cours",      C["ec"],          C["ec"]),
+    ("Date à programmer", "À programmer", C["prog"],    C["prog"]),
     ("À facturer",   "À facturer",    C["afact"],       C["afact"]),
     ("Facturé",      "Facturé",       C["fact"],        C["fact"]),
     ("Clos",         "Clos",          C["clos"],        C["clos"]),
@@ -1379,7 +1410,9 @@ class StatsCardsWidget(tk.Frame):
             w.destroy()
         stats = db.get_stats()
         key_map = {
-            "En cours": stats["En cours"], "À facturer": stats["À facturer"],
+            "En cours": stats["En cours"],
+            "Date à programmer": stats.get("Date à programmer", 0),
+            "À facturer": stats["À facturer"],
             "Facturé": stats["Facturé"], "Clos": stats["Clos"],
             "Total": stats["Total"],
             "Urgentes": stats["Urgentes"], "Critiques": stats["Critiques"],
@@ -1415,12 +1448,12 @@ class UrgentesWidget(tk.Frame):
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="⚡ Interventions urgentes en cours",
+        tk.Label(self, text="Interventions urgentes en cours",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["danger"]).pack(anchor="w")
         cols = ("urg","num_bon","client","navire","tech","date")
         col_defs = [("urg","⚡",70),("num_bon","N° Bon",115),("client","Client",170),
                     ("navire","Navire",140),("tech","Tech.",110),("date","Date",90)]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
         self._cache = []
         self.tree.bind("<Double-1>", self._open)
@@ -1450,18 +1483,98 @@ class UrgentesWidget(tk.Frame):
             pass
 
 
+class AProgrammerWidget(tk.Frame):
+    """Liste des bons au statut 'Date à programmer'."""
+    def __init__(self, master, app):
+        super().__init__(master, bg=C["bg"])
+        self.app = app
+        tk.Label(self, text="Bons à programmer",
+                 font=("Arial", 11, "bold"), bg=C["bg"], fg=C["prog"]).pack(anchor="w")
+        cols = ("urg","num_bon","client","navire","tech","date")
+        col_defs = [("urg","⚡",70),("num_bon","N° Bon",115),("client","Client",170),
+                    ("navire","Navire",140),("tech","Tech.",110),("date","Date",90)]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
+        tf.pack(fill="x", pady=(2, 0))
+        self._cache = []
+        self.tree.bind("<Double-1>", self._open)
+
+    def refresh(self):
+        invs = db.get_interventions_a_programmer(limit=8)
+        self._cache = list(invs)
+        rows  = []
+        urgs  = []
+        for r in self._cache:
+            rows.append((r["urgence"], r["num_bon"], r["client_nom"] or "",
+                         r["navire"] or "", r["technicien"], r["date_creation"]))
+            urgs.append(r["urgence"])
+        if not rows:
+            self.tree.delete(*self.tree.get_children())
+            self.tree.insert("", "end", values=("—", "(aucun)", "", "", "", ""))
+        else:
+            fill_tree(self.tree, rows, urgences=urgs)
+
+    def _open(self, _ev):
+        sel = self.tree.selection()
+        if not sel or not self._cache: return
+        try:
+            r = self._cache[int(sel[0])]
+            BonDialog(self, self.app, inv_id=r["id"], on_save=lambda: (self.app.refresh_frame("dashboard"), self.app.refresh_frame("interventions")))
+        except (ValueError, IndexError):
+            pass
+
+
+class AFacturerWidget(tk.Frame):
+    """Liste des bons au statut 'À facturer'."""
+    def __init__(self, master, app):
+        super().__init__(master, bg=C["bg"])
+        self.app = app
+        tk.Label(self, text="Bons à facturer",
+                 font=("Arial", 11, "bold"), bg=C["bg"], fg=C["afact"]).pack(anchor="w")
+        cols = ("urg","num_bon","client","navire","tech","date")
+        col_defs = [("urg","⚡",70),("num_bon","N° Bon",115),("client","Client",170),
+                    ("navire","Navire",140),("tech","Tech.",110),("date","Date",90)]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
+        tf.pack(fill="x", pady=(2, 0))
+        self._cache = []
+        self.tree.bind("<Double-1>", self._open)
+
+    def refresh(self):
+        invs = db.get_interventions_a_facturer(limit=20)
+        self._cache = list(invs)
+        rows  = []
+        urgs  = []
+        for r in self._cache:
+            rows.append((r["urgence"], r["num_bon"], r["client_nom"] or "",
+                         r["navire"] or "", r["technicien"], r["date_creation"]))
+            urgs.append(r["urgence"])
+        if not rows:
+            self.tree.delete(*self.tree.get_children())
+            self.tree.insert("", "end", values=("—", "(aucun)", "", "", "", ""))
+        else:
+            fill_tree(self.tree, rows, urgences=urgs)
+
+    def _open(self, _ev):
+        sel = self.tree.selection()
+        if not sel or not self._cache: return
+        try:
+            r = self._cache[int(sel[0])]
+            BonDialog(self, self.app, inv_id=r["id"], on_save=lambda: (self.app.refresh_frame("dashboard"), self.app.refresh_frame("interventions")))
+        except (ValueError, IndexError):
+            pass
+
+
 class ActiviteRecenteWidget(tk.Frame):
     """Derniers bons modifiés."""
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="🕒 Activité récente",
+        tk.Label(self, text="Activité récente",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["header"]).pack(anchor="w")
         cols = ("num_bon","client","statut","tech","modif")
         col_defs = [("num_bon","N° Bon",115),("client","Client",180),
                     ("statut","Statut",80),("tech","Tech.",110),
                     ("modif","Modifié (Paris)",120)]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
         self._cache = []
         self.tree.bind("<Double-1>", self._open)
@@ -1496,13 +1609,13 @@ class GarantieExpiranteWidget(tk.Frame):
         self.app = app
         head = tk.Frame(self, bg=C["bg"])
         head.pack(fill="x")
-        tk.Label(head, text="⏰ Garanties expirant dans 90 jours",
+        tk.Label(head, text="Garanties expirant dans 90 jours",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["warn"]).pack(side="left")
         cols = ("ns","client","navire","fin","jours")
         col_defs = [("ns","N° Série",130),("client","Client",170),
                     ("navire","Navire/Site",140),("fin","Mise svc",95),
                     ("jours","Jours restants",110, "center")]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
 
     def refresh(self):
@@ -1525,7 +1638,7 @@ class ParTechnicienWidget(tk.Frame):
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="🛠️ Charge par technicien",
+        tk.Label(self, text="Charge par technicien",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["header"]).pack(anchor="w")
         cols = ("tech","ec","afact","fact","clos","total")
         col_defs = [("tech","Technicien",180),
@@ -1534,7 +1647,7 @@ class ParTechnicienWidget(tk.Frame):
                     ("fact", "Facturé",    75, "center"),
                     ("clos", "Clos",       70, "center"),
                     ("total","Total",      65, "center")]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
 
     def refresh(self):
@@ -1554,13 +1667,13 @@ class ParTypeWidget(tk.Frame):
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="🔧 Répartition par type d'intervention",
+        tk.Label(self, text="Répartition par type d'intervention",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["header"]).pack(anchor="w")
         cols = ("type","ec","total")
         col_defs = [("type","Type",260),
                     ("ec","En cours",80, "center"),
                     ("total","Total",80, "center")]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
 
     def refresh(self):
@@ -1578,14 +1691,14 @@ class NonNotifiesWidget(tk.Frame):
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="📧 Bons en cours non notifiés",
+        tk.Label(self, text="Bons en cours non notifiés",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["warn"]).pack(anchor="w")
         cols = ("num_bon","client","cli","tech","tec")
         col_defs = [("num_bon","N° Bon",115),("client","Client",200),
                     ("cli","Client notifié",110, "center"),
                     ("tech","Technicien",130),
                     ("tec","Tech. notifié",110, "center")]
-        tf, self.tree = mk_tree(self, cols, col_defs, height=5)
+        tf, self.tree = mk_tree(self, cols, col_defs, height=5, show_hsb=False)
         tf.pack(fill="x", pady=(2, 0))
         self._cache = []
         self.tree.bind("<Double-1>", self._open)
@@ -1622,7 +1735,7 @@ class ClassificationsWidget(tk.Frame):
     def __init__(self, master, app):
         super().__init__(master, bg=C["bg"])
         self.app = app
-        tk.Label(self, text="🏷️ Répartition par classification",
+        tk.Label(self, text="Répartition par classification",
                  font=("Arial", 11, "bold"), bg=C["bg"], fg=C["header"]).pack(anchor="w")
         self.row = tk.Frame(self, bg=C["bg"])
         self.row.pack(fill="x", pady=(2, 0))
@@ -1646,6 +1759,8 @@ class ClassificationsWidget(tk.Frame):
 WIDGET_CLASSES = {
     "stats_cards":        StatsCardsWidget,
     "urgentes":           UrgentesWidget,
+    "a_programmer":       AProgrammerWidget,
+    "a_facturer":         AFacturerWidget,
     "activite_recente":   ActiviteRecenteWidget,
     "garantie_expirante": GarantieExpiranteWidget,
     "par_technicien":     ParTechnicienWidget,
@@ -1711,8 +1826,26 @@ class DashboardConfigDialog(tk.Toplevel):
         tk.Label(parent, text="Cochez les widgets à afficher. Utilisez ▲▼ pour réorganiser.",
                  bg=C["bg"], font=("Arial", 9, "italic"), fg="#666").pack(anchor="w", padx=6, pady=(6, 4))
 
-        self.list_frame = tk.Frame(parent, bg=C["bg"])
-        self.list_frame.pack(fill="both", expand=True, padx=6, pady=4)
+        # Zone scrollable
+        scroll_outer = tk.Frame(parent, bg=C["bg"])
+        scroll_outer.pack(fill="both", expand=True, padx=6, pady=4)
+        self._list_canvas = tk.Canvas(scroll_outer, bg=C["bg"], highlightthickness=0)
+        _vsb = ttk.Scrollbar(scroll_outer, orient="vertical", command=self._list_canvas.yview)
+        self._list_canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        self._list_canvas.pack(side="left", fill="both", expand=True)
+        self.list_frame = tk.Frame(self._list_canvas, bg=C["bg"])
+        _win = self._list_canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_frame.bind("<Configure>",
+            lambda e: self._list_canvas.configure(scrollregion=self._list_canvas.bbox("all")))
+        self._list_canvas.bind("<Configure>",
+            lambda e: self._list_canvas.itemconfig(_win, width=e.width))
+
+        def _on_wheel(ev):
+            try: self._list_canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except tk.TclError: pass
+        self._list_canvas.bind("<Enter>", lambda e: self._list_canvas.bind_all("<MouseWheel>", _on_wheel))
+        self._list_canvas.bind("<Leave>", lambda e: self._list_canvas.unbind_all("<MouseWheel>"))
 
         self._render_widgets_list(active)
 
@@ -1798,10 +1931,10 @@ class DashboardConfigDialog(tk.Toplevel):
         if messagebox.askyesno("Réinitialiser",
                 "Restaurer les widgets et cartes par défaut ?"):
             db.set_dashboard_widgets([
-                "stats_cards", "urgentes", "activite_recente",
+                "stats_cards", "urgentes", "a_programmer", "activite_recente",
                 "par_technicien", "non_notifies"])
             db.set_dashboard_cards([
-                "En cours", "À facturer", "Facturé", "Clos", "Total",
+                "En cours", "Date à programmer", "À facturer", "Facturé", "Clos", "Total",
                 "Urgentes", "Clients", "Moteurs", "Tech."])
             if self.on_save: self.on_save()
             self.destroy()
@@ -1843,8 +1976,8 @@ class DashboardFrame(tk.Frame):
         def _on_wheel(ev):
             try: self.canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
             except tk.TclError: pass
-        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", _on_wheel))
-        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        self.canvas.bind("<MouseWheel>", _on_wheel)
+        self._on_wheel = _on_wheel
 
         self._widgets = {}  # key → widget instance
 
@@ -1881,7 +2014,15 @@ class DashboardFrame(tk.Frame):
             w.pack(fill="x")
             self._widgets[key] = w
         if self._widgets:
+            self._patch_wheels(self.inner)
             self.refresh()
+
+    def _patch_wheels(self, widget):
+        """Bind <MouseWheel> sur tous les descendants pour scroller le canvas (et bloquer le scroll natif des Treeview)."""
+        on_wheel = self._on_wheel
+        for child in widget.winfo_children():
+            child.bind("<MouseWheel>", lambda ev, f=on_wheel: (f(ev), "break")[1])
+            self._patch_wheels(child)
 
     def refresh(self):
         if not self._widgets:
@@ -2315,7 +2456,7 @@ class MoteursFrame(tk.Frame):
         self.sel_info = tk.Label(af, text="", bg=C["bg"],
                                   fg=C["text_muted"], font=F["small"])
         self.sel_info.pack(side="left", padx=(12, 0))
-        self.tree.bind("<Double-1>", lambda e: self._modifier())
+        self.tree.bind("<Double-1>", lambda e: None if self.tree.identify_column(e.x) == "#0" else self._modifier())
         self.tree.bind("<<TreeviewSelect>>", self._on_select_change)
         self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self._cache = []
@@ -2369,7 +2510,7 @@ class MoteursFrame(tk.Frame):
             return
         for j, se in enumerate(children):
             self._by_id[se["id"]] = se
-            tags = ["even" if j % 2 == 0 else "odd"]
+            tags = ["se_even" if j % 2 == 0 else "se_odd"]
             self.tree.insert(parent_id, "end", iid=se["id"],
                               values=self._row_values(se), tags=tags)
 
@@ -2752,19 +2893,59 @@ class GarantieDialog(tk.Toplevel):
         self.is_edit = garantie_id is not None
         self.title("Modifier la garantie" if self.is_edit
                    else "Nouvelle garantie moteur")
-        self.geometry("700x760")
+        self.geometry("860x840")
+        self.minsize(860, 620)
         self.configure(bg=C["bg"])
         self.grab_set()
 
         self._clients = list(db.get_clients())
         self._moteurs = list(db.get_moteurs())
+        self._techniciens = list(db.get_techniciens())
+        self._contacts = list(db.get_contacts())
         self._moteur_by_ns = {m["num_serie"]: m for m in self._moteurs}
         self._client_by_id = {c["id"]: c for c in self._clients}
+        self._tech_by_nom = {t["nom"]: t for t in self._techniciens}
+        self._contact_by_nom = {c["nom"]: c for c in self._contacts}
 
         mk_header(self, "Garantie moteur",
                   "   Dossier de garantie constructeur / interne")
 
-        body = tk.Frame(self, bg=C["bg"])
+        # Boutons packés en bas EN PREMIER pour rester visibles au redimensionnement
+        bf = tk.Frame(self, bg=C["bg"])
+        bf.pack(side="bottom", pady=12)
+        mk_btn(bf, "💾 Enregistrer", lambda: self._save(False)).pack(
+            side="left", padx=6)
+        mk_btn(bf, "📄 Enregistrer + Fiche", lambda: self._save(True)).pack(
+            side="left", padx=6)
+        mk_btn(bf, "📧 Prévenir client",
+               self._mail_client_garantie, color=C["btn2"]).pack(side="left", padx=6)
+        mk_btn(bf, "📧 Prévenir responsable",
+               self._mail_tech_garantie, color=C["btn2"]).pack(side="left", padx=6)
+        mk_btn(bf, "Annuler", self.destroy, color=C["btn3"]).pack(
+            side="left", padx=6)
+
+        _canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0)
+        _vsb = ttk.Scrollbar(self, orient="vertical", command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        _canvas.pack(fill="both", expand=True)
+        body = tk.Frame(_canvas, bg=C["bg"])
+        _win = _canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: _canvas.configure(scrollregion=_canvas.bbox("all")))
+        _canvas.bind("<Configure>",
+                     lambda e: _canvas.itemconfig(_win, width=e.width))
+
+        def _on_wheel(ev):
+            try: _canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except tk.TclError: pass
+        self.bind("<MouseWheel>", _on_wheel)
+        for _cls in ("TFrame", "Frame", "TLabel", "Label",
+                     "TCheckbutton", "Checkbutton", "TButton", "Button"):
+            self.bind_class(_cls, "<MouseWheel>", _on_wheel, add="+")
+
+        # padding interne du contenu
+        body = tk.Frame(body, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=24, pady=12)
 
         # Moteur (N° série) — détermine le client automatiquement
@@ -2822,6 +3003,35 @@ class GarantieDialog(tk.Toplevel):
                      values=db.get_statuts_garantie(), width=30,
                      state="readonly").pack(fill="x", pady=(2, 0))
 
+        # Responsable garantie
+        tk.Label(body, text="Responsable garantie", bg=C["bg"],
+                 font=F["body_bold"], anchor="w").pack(anchor="w")
+        self.responsable_var = tk.StringVar()
+        self.responsable_combo = SearchableCombobox(
+            body, textvariable=self.responsable_var,
+            values=[t["nom"] for t in self._techniciens], width=44)
+        self.responsable_combo.pack(fill="x", pady=(2, 10))
+
+        # Demandeur
+        tk.Label(body, text="Demandeur", bg=C["bg"],
+                 font=F["body_bold"], anchor="w").pack(anchor="w")
+        _contact_noms = [c["nom"] for c in self._contacts]
+        self.demandeur_var = tk.StringVar()
+        self.demandeur_combo = SearchableCombobox(
+            body, textvariable=self.demandeur_var,
+            values=_contact_noms, width=44, allow_free_text=True)
+        self.demandeur_combo.pack(fill="x", pady=(2, 4))
+        self.demandeur_combo.bind("<<ComboboxSelected>>", self._on_demandeur_selected)
+        dem_row = tk.Frame(body, bg=C["bg"])
+        dem_row.pack(fill="x", pady=(0, 10))
+        self.email_demand_var = tk.StringVar()
+        self.tel_demand_var = tk.StringVar()
+        for lbl, var in [("Email", self.email_demand_var), ("Tél.", self.tel_demand_var)]:
+            f = tk.Frame(dem_row, bg=C["bg"])
+            f.pack(side="left", padx=(0, 16))
+            tk.Label(f, text=lbl, bg=C["bg"], font=F["body"]).pack(anchor="w")
+            ttk.Entry(f, textvariable=var, width=24).pack()
+
         # Dates + montant
         row3 = tk.Frame(body, bg=C["bg"])
         row3.pack(fill="x", pady=(0, 10))
@@ -2872,6 +3082,7 @@ class GarantieDialog(tk.Toplevel):
             body, textvariable=self.inv_lie_var,
             values=labels, width=44)
         self.inv_lie_combo.pack(fill="x", pady=(2, 4))
+        self.inv_lie_combo.bind("<<ComboboxSelected>>", self._on_inv_lie_selected)
         tk.Label(body, text="💡 Tapez un n° de bon, un n° de série, un type "
                             "ou un client pour filtrer",
                  bg=C["bg"], fg=C["text_muted"],
@@ -2884,15 +3095,6 @@ class GarantieDialog(tk.Toplevel):
                                  wrap="word", relief="solid", bd=1,
                                  padx=6, pady=4)
         self.txt_comm.pack(fill="x", pady=(2, 4))
-
-        bf = tk.Frame(self, bg=C["bg"])
-        bf.pack(side="bottom", pady=12)
-        mk_btn(bf, "💾 Enregistrer", lambda: self._save(False)).pack(
-            side="left", padx=6)
-        mk_btn(bf, "📄 Enregistrer + Fiche", lambda: self._save(True)).pack(
-            side="left", padx=6)
-        mk_btn(bf, "Annuler", self.destroy, color=C["btn3"]).pack(
-            side="left", padx=6)
 
         if self.is_edit:
             self.after(50, self._load)
@@ -2914,6 +3116,27 @@ class GarantieDialog(tk.Toplevel):
                     "", db.GARANTIE_ATTRIBUTION_DEFAULT):
                 self.attr_var.set(marque)
 
+    def _on_demandeur_selected(self, *_):
+        c = self._contact_by_nom.get(self.demandeur_var.get())
+        if c:
+            if not self.email_demand_var.get():
+                self.email_demand_var.set(c.get("email", ""))
+            if not self.tel_demand_var.get():
+                self.tel_demand_var.set(c.get("telephone", ""))
+
+    def _on_inv_lie_selected(self, *_):
+        inv = self._inv_labels.get(self.inv_lie_var.get())
+        if not inv:
+            return
+        if not self.demandeur_var.get():
+            nom = row_get(inv, "nom_demandeur")
+            if nom:
+                self.demandeur_combo.set(nom)
+                if not self.email_demand_var.get():
+                    self.email_demand_var.set(row_get(inv, "email_demandeur"))
+                if not self.tel_demand_var.get():
+                    self.tel_demand_var.set(row_get(inv, "telephone_demandeur"))
+
     def _load(self):
         g = db.get_garantie(garantie_id=self.garantie_id)
         if not g:
@@ -2928,6 +3151,22 @@ class GarantieDialog(tk.Toplevel):
         self.attr_var.set(row_get(g, "attribution",
                                    db.GARANTIE_ATTRIBUTION_DEFAULT))
         self.statut_var.set(row_get(g, "statut", db.GARANTIE_STATUT_DEFAULT))
+        self.responsable_combo.set(row_get(g, "responsable"))
+        # Demandeur : depuis la garantie, sinon depuis l'intervention liée
+        nom_dem = row_get(g, "nom_demandeur")
+        if not nom_dem:
+            inv_id_dem = row_get(g, "intervention_id")
+            if inv_id_dem:
+                inv = db.get_intervention(inv_id=inv_id_dem)
+                if inv:
+                    nom_dem = row_get(inv, "nom_demandeur")
+                    if not self.email_demand_var.get():
+                        self.email_demand_var.set(row_get(inv, "email_demandeur"))
+                    if not self.tel_demand_var.get():
+                        self.tel_demand_var.set(row_get(inv, "telephone_demandeur"))
+        self.demandeur_combo.set(nom_dem)
+        self.email_demand_var.set(row_get(g, "email_demandeur") or self.email_demand_var.get())
+        self.tel_demand_var.set(row_get(g, "telephone_demandeur") or self.tel_demand_var.get())
         self.d_ouv_var.set(row_get(g, "date_ouverture"))
         self.d_clo_var.set(row_get(g, "date_cloture"))
         self.montant_var.set(row_get(g, "montant"))
@@ -2944,6 +3183,68 @@ class GarantieDialog(tk.Toplevel):
         self.txt_desc.insert("1.0", row_get(g, "description"))
         self.txt_comm.delete("1.0", "end")
         self.txt_comm.insert("1.0", row_get(g, "commentaires"))
+
+    def _mail_client_garantie(self):
+        if not self.is_edit:
+            messagebox.showinfo("Sauvegarde requise",
+                "Enregistrez d'abord le dossier avant de notifier le client.")
+            return
+        g = db.get_garantie(garantie_id=self.garantie_id)
+        client = db.get_client(g["client_id"]) if g.get("client_id") else None
+        moteur = db.get_moteur(g["moteur_id"]) if g.get("moteur_id") else None
+        email = (row_get(client, "email") if client else "")
+        if not email:
+            messagebox.showwarning("Email manquant",
+                "Aucun email renseigné pour ce client.")
+            return
+        num_ems = row_get(g, "num_ems")
+        fiche_path = ""
+        _d = Path(_dossiers_root_garanties()) / num_ems
+        for ext in (".pdf", ".html"):
+            p = _d / f"fiche_garantie{ext}"
+            if p.exists():
+                fiche_path = str(p)
+                break
+        _, pj_auto = mailer.email_garantie_client(g, client or {}, moteur or {},
+                                                   fiche_path)
+        if not pj_auto and fiche_path:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez la fiche manuellement depuis :\n{_d}")
+        db.mark_notifie_garantie(self.garantie_id, "client")
+
+    def _mail_tech_garantie(self):
+        if not self.is_edit:
+            messagebox.showinfo("Sauvegarde requise",
+                "Enregistrez d'abord le dossier avant de notifier le responsable.")
+            return
+        g = db.get_garantie(garantie_id=self.garantie_id)
+        responsable = row_get(g, "responsable")
+        if not responsable:
+            messagebox.showwarning("Responsable manquant",
+                "Aucun responsable désigné pour ce dossier.")
+            return
+        t = db.get_technicien_by_nom(responsable)
+        tech_email = row_get(t, "email") if t else ""
+        if not tech_email:
+            messagebox.showwarning("Email manquant",
+                f"Aucun email renseigné pour {responsable}.")
+            return
+        client = db.get_client(g["client_id"]) if g.get("client_id") else None
+        moteur = db.get_moteur(g["moteur_id"]) if g.get("moteur_id") else None
+        num_ems = row_get(g, "num_ems")
+        fiche_path = ""
+        _d = Path(_dossiers_root_garanties()) / num_ems
+        for ext in (".pdf", ".html"):
+            p = _d / f"fiche_garantie{ext}"
+            if p.exists():
+                fiche_path = str(p)
+                break
+        _, pj_auto = mailer.email_garantie_technicien(g, client or {}, moteur or {},
+                                                       tech_email, fiche_path)
+        if not pj_auto and fiche_path:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez la fiche manuellement depuis :\n{_d}")
+        db.mark_notifie_garantie(self.garantie_id, "tech")
 
     def _get_intervention_id_lie(self):
         """Retourne l'id de l'intervention liee selectionnee, ou '' si aucune."""
@@ -2980,6 +3281,10 @@ class GarantieDialog(tk.Toplevel):
             "client_id": m["client_id"],
             "attribution": self.attr_var.get(),
             "statut": self.statut_var.get(),
+            "responsable": self.responsable_var.get().strip(),
+            "nom_demandeur": self.demandeur_var.get().strip(),
+            "email_demandeur": self.email_demand_var.get().strip(),
+            "telephone_demandeur": self.tel_demand_var.get().strip(),
             "date_ouverture": self.d_ouv_var.get().strip(),
             "date_cloture": self.d_clo_var.get().strip(),
             "montant": self.montant_var.get().strip(),
@@ -3980,11 +4285,21 @@ def _fmt_h(h):
         hi += 1; mi = 0
     return f"{hi}h{mi:02d}" if mi else f"{hi}h"
 
+def _parse_km(s):
+    s = str(s).strip().lower().replace(',', '.').replace(' ', '')
+    if not s:
+        return None
+    m = _re_depl.match(r'^(\d+(?:\.\d+)?)(?:km)?$', s)
+    return float(m.group(1)) if m else None
+
+def _fmt_km(v):
+    return f"{int(v)} km" if v == int(v) else f"{v:.1f} km"
+
 
 class TechnicienFrame(tk.Frame):
     """Champs temps & frais pour un technicien au sein d'une journee."""
     TEXTE_FIELDS = [
-        ("trajet_aller_retour", "Temps de trajet"),
+        ("trajet_aller_retour", "Km parcourus"),
         ("duree_intervention",  "Duree de l'intervention"),
         ("temps_preparation",   "Temps de preparation"),
         ("temps_rangement",     "Temps de rangement"),
@@ -4206,7 +4521,7 @@ class JourFrame(tk.Frame):
 class DeplacementsTable(tk.Frame):
     """Saisie des temps et frais : plusieurs jours, plusieurs techniciens par jour."""
 
-    _T_KEYS = [("trajet_aller_retour", "Trajet A/R"),
+    _T_KEYS = [("trajet_aller_retour", "Distance totale"),
                ("duree_intervention",  "Duree intervention"),
                ("temps_preparation",   "Preparation"),
                ("temps_rangement",     "Rangement")]
@@ -4309,13 +4624,19 @@ class DeplacementsTable(tk.Frame):
         for jf in self._jour_frames:
             for tf in jf._tech_frames:
                 for key, _ in self._T_KEYS:
-                    v = _parse_h(tf.vars[key].get())
+                    parse = _parse_km if key == "trajet_aller_retour" else _parse_h
+                    v = parse(tf.vars[key].get())
                     if v is not None:
                         sums[key] = (sums[key] or 0) + v
                 for key, _ in self._F_KEYS:
                     frais[key] += int(tf.check_vars[key].get())
         for key, _ in self._T_KEYS:
-            self._total_vars[key].set(_fmt_h(sums[key]) if sums[key] is not None else "—")
+            if sums[key] is None:
+                self._total_vars[key].set("—")
+            elif key == "trajet_aller_retour":
+                self._total_vars[key].set(_fmt_km(sums[key]))
+            else:
+                self._total_vars[key].set(_fmt_h(sums[key]))
         for key, _ in self._F_KEYS:
             self._total_vars[key].set(str(frais[key]))
 
@@ -4834,6 +5155,8 @@ class MoteurDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.grab_set()
         self._clients = list(db.get_clients())
+        self._types_moteur = db.get_types_moteur()
+        self._type_to_marque = {t["libelle"]: t["marque"] for t in self._types_moteur}
         self.client_var = tk.StringVar()
         client_src = moteur or parent_moteur
         if client_src and client_src.get("client_id"):
@@ -4866,6 +5189,7 @@ class MoteurDialog(tk.Toplevel):
             return ""
         self.v = {k: tk.StringVar(value=_default(k)) for k, _ in self.FIELDS}
         self._marque_combo = None
+        self._type_moteur_combo = None
         for i,(key,lbl) in enumerate(self.FIELDS, start=1):
             tk.Label(f, text=lbl, bg=C["bg"], font=("Arial",10),
                      anchor="e", width=22).grid(row=i, column=0, sticky="e", padx=(0,6), pady=4)
@@ -4875,6 +5199,20 @@ class MoteurDialog(tk.Toplevel):
                 EmailEntry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
             elif key == "client_utilisateur_adresse":
                 ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
+            elif key == "type_moteur":
+                row_t = tk.Frame(f, bg=C["bg"])
+                row_t.grid(row=i, column=1, pady=4, sticky="w")
+                self._type_moteur_combo = SearchableCombobox(
+                    row_t, textvariable=self.v["type_moteur"],
+                    values=[t["libelle"] for t in self._types_moteur],
+                    width=30, min_chars_to_open=1, allow_free_text=True)
+                self._type_moteur_combo.pack(side="left")
+                self._type_moteur_combo.bind("<<ComboboxSelected>>",
+                                              self._on_type_moteur_selected)
+                def _open_types_moteur():
+                    TypesMoteurDialog(self, self.app,
+                        on_close=self._reload_types_moteur)
+                mk_btn(row_t, "⚙", _open_types_moteur, color=C["btn2"]).pack(side="left", padx=(8,0))
             elif key == "marque":
                 row_m = tk.Frame(f, bg=C["bg"])
                 row_m.grid(row=i, column=1, pady=4, sticky="w")
@@ -4882,9 +5220,11 @@ class MoteurDialog(tk.Toplevel):
                     row_m, textvariable=self.v["marque"],
                     values=db.get_marques(), width=30)
                 self._marque_combo.pack(side="left")
+                self._marque_combo.bind("<<ComboboxSelected>>",
+                                         self._on_marque_selected)
                 def _open_marques():
-                    MarquesDialog(self, self.app, on_close=lambda: self._marque_combo.config(
-                        values=db.get_marques()))
+                    MarquesDialog(self, self.app,
+                        on_close=lambda: self._marque_combo.set_values(db.get_marques()))
                 mk_btn(row_m, "⚙", _open_marques, color=C["btn2"]).pack(side="left", padx=(8,0))
             else:
                 ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
@@ -4912,6 +5252,30 @@ class MoteurDialog(tk.Toplevel):
         db.upsert_moteur(data, moteur_id=self.moteur["id"] if self.moteur else None)
         if self.on_save: self.on_save()
         self.destroy()
+
+    def _on_type_moteur_selected(self, *_):
+        libelle = self.v["type_moteur"].get()
+        marque = self._type_to_marque.get(libelle, "")
+        if marque and not self.v["marque"].get().strip():
+            self.v["marque"].set(marque)
+
+    def _on_marque_selected(self, *_):
+        marque = self.v["marque"].get().strip()
+        if marque:
+            filtered = [t["libelle"] for t in self._types_moteur
+                        if t.get("marque") == marque]
+            types = filtered if filtered else [t["libelle"] for t in self._types_moteur]
+        else:
+            types = [t["libelle"] for t in self._types_moteur]
+        if self._type_moteur_combo:
+            self._type_moteur_combo.set_values(types)
+
+    def _reload_types_moteur(self):
+        self._types_moteur = db.get_types_moteur()
+        self._type_to_marque = {t["libelle"]: t["marque"] for t in self._types_moteur}
+        if self._type_moteur_combo:
+            self._type_moteur_combo.set_values(
+                [t["libelle"] for t in self._types_moteur])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5037,6 +5401,109 @@ class MarquesDialog(tk.Toplevel):
                 f"Supprimer la marque '{cur}' ?\n\n"
                 "(Les bons existants conservent leur libellé.)"):
             db.delete_marque(cur)
+            self._refresh()
+
+
+class TypesMoteurDialog(tk.Toplevel):
+    def __init__(self, parent, app, on_close=None):
+        super().__init__(parent)
+        self.app = app
+        self.on_close = on_close
+        self._items = []
+        self.title("Types de moteur")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.geometry("420x500")
+        self.grab_set()
+
+        tk.Label(self, text="Types de moteur", bg=C["bg"],
+                 font=("Arial",11,"bold"), fg=C["header"]).pack(pady=(14,4))
+
+        lf = tk.Frame(self, bg=C["bg"]); lf.pack(fill="both", expand=True, padx=16, pady=4)
+        self.lst = tk.Listbox(lf, font=("Arial",10), height=9,
+                              selectbackground=C["btn"], selectforeground="white")
+        self.lst.pack(fill="both", expand=True)
+        self.lst.bind("<<ListboxSelect>>", self._on_select)
+
+        ff = tk.Frame(self, bg=C["bg"]); ff.pack(fill="x", padx=16, pady=(6,2))
+        tk.Label(ff, text="Type :", bg=C["bg"], width=17, anchor="e",
+                 font=("Arial",10)).grid(row=0, column=0, padx=(0,6), pady=4)
+        self.input_libelle = tk.StringVar()
+        ttk.Entry(ff, textvariable=self.input_libelle, width=26).grid(row=0, column=1, sticky="w")
+        tk.Label(ff, text="Marque associée :", bg=C["bg"], width=17, anchor="e",
+                 font=("Arial",10)).grid(row=1, column=0, padx=(0,6), pady=4)
+        self.input_marque = tk.StringVar()
+        self._marque_cb = SearchableCombobox(ff, textvariable=self.input_marque,
+                                              values=db.get_marques(), width=24,
+                                              allow_free_text=True)
+        self._marque_cb.grid(row=1, column=1, sticky="w")
+
+        bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=10)
+        mk_btn(bf, "➕ Ajouter", self._add).pack(side="left", padx=4)
+        mk_btn(bf, "✏️ Modifier", self._edit).pack(side="left", padx=4)
+        mk_btn(bf, "🗑️ Supprimer", self._del, color=C["danger"]).pack(side="left", padx=4)
+        mk_btn(bf, "Fermer", self._close, color="#888").pack(side="left", padx=4)
+        self._refresh()
+
+    def _refresh(self):
+        self._items = db.get_types_moteur()
+        self.lst.delete(0, "end")
+        for t in self._items:
+            label = t["libelle"]
+            if t.get("marque"):
+                label += f"  ← {t['marque']}"
+            self.lst.insert("end", label)
+
+    def _on_select(self, *_):
+        sel = self.lst.curselection()
+        if not sel: return
+        item = self._items[sel[0]]
+        self.input_libelle.set(item["libelle"])
+        self.input_marque.set(item.get("marque") or "")
+
+    def _close(self):
+        if self.on_close:
+            self.on_close()
+        self.destroy()
+
+    def _add(self):
+        lib = self.input_libelle.get().strip()
+        if not lib: return
+        marque = self.input_marque.get().strip()
+        if not db.add_type_moteur(lib, marque):
+            messagebox.showwarning("Doublon", f"Le type '{lib}' existe déjà.")
+            return
+        self.input_libelle.set("")
+        self.input_marque.set("")
+        self._refresh()
+
+    def _selected_item(self):
+        sel = self.lst.curselection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un type dans la liste.")
+            return None
+        return self._items[sel[0]]
+
+    def _edit(self):
+        item = self._selected_item()
+        if not item: return
+        new_lib = self.input_libelle.get().strip()
+        new_marque = self.input_marque.get().strip()
+        if not new_lib: return
+        if not db.update_type_moteur(item["libelle"], new_lib, new_marque):
+            messagebox.showwarning("Erreur", "Ce nom existe déjà.")
+            return
+        self._refresh()
+
+    def _del(self):
+        item = self._selected_item()
+        if not item: return
+        if messagebox.askyesno("Supprimer",
+                f"Supprimer le type '{item['libelle']}' ?\n\n"
+                "(Les moteurs existants conservent leur libellé.)"):
+            db.delete_type_moteur(item["libelle"])
+            self.input_libelle.set("")
+            self.input_marque.set("")
             self._refresh()
 
 
@@ -5392,7 +5859,6 @@ class BonDialog(tk.Toplevel):
     """Formulaire création / modification bon, conforme au modèle EMS."""
 
     MOTEUR_INFO_FIELDS = [
-        ("navire",            "Navire / Site"),
         ("machine",           "Machine"),
         ("type_moteur",       "Type moteur / inverseur"),
         ("date_mise_service", "Mise en service"),
@@ -5434,15 +5900,21 @@ class BonDialog(tk.Toplevel):
             self._clients     = refs.get("clients", [])
             self._all_moteurs = refs.get("moteurs", [])
             self._techniciens = refs.get("techniciens", [])
+            self._contacts    = []
         else:
             self._clients     = list(db.get_clients())
             self._all_moteurs = list(db.get_moteurs())
             self._techniciens = list(db.get_techniciens())
+            try:
+                self._contacts = list(db.get_contacts())
+            except Exception:
+                self._contacts = []
 
         self._client_by_id  = {c["id"]:  c for c in self._clients}
         self._client_by_nom = {c["nom"]: c for c in self._clients}
         self._moteur_by_id  = {m["id"]:  m for m in self._all_moteurs}
         self._moteur_by_ns  = {m["num_serie"]: m for m in self._all_moteurs}
+        self._contact_by_nom = {c["nom"]: c for c in self._contacts}
 
         # Cases à cocher : options + classifications
         self.chk = {k: tk.IntVar(value=0) for k in [
@@ -5514,13 +5986,27 @@ class BonDialog(tk.Toplevel):
         self.email_demand_var   = tk.StringVar()
         self.tel_demand_var     = tk.StringVar()
 
-        # Lieu + signataire (personne qui signe le bon)
-        for lbl, var, cls in [("Lieu de l'intervention", self.lieu_var,       ttk.Entry),
-                              ("Nom du signataire",      self.signataire_var, ttk.Entry),
-                              ("Courriel du signataire", self.email_sig_var,  EmailEntry),
-                              ("Telephone signataire",   self.tel_sig_var,    ttk.Entry)]:
-            r = tk.Frame(p, bg=C["bg"])
-            r.pack(fill="x", padx=20, pady=2)
+        contact_noms = [] if self.is_offline else [c["nom"] for c in self._contacts]
+
+        # Lieu de l'intervention
+        r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=2)
+        tk.Label(r, text="Lieu de l'intervention", bg=C["bg"], font=("Arial",10),
+                 width=24, anchor="e").pack(side="left", padx=(0,8))
+        ttk.Entry(r, textvariable=self.lieu_var, width=46).pack(side="left")
+
+        # Nom du signataire — SearchableCombobox alimenté par les contacts connus
+        r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=2)
+        tk.Label(r, text="Nom du signataire", bg=C["bg"], font=("Arial",10),
+                 width=24, anchor="e").pack(side="left", padx=(0,8))
+        self.signataire_combo = SearchableCombobox(r, textvariable=self.signataire_var,
+                                                   values=contact_noms, width=44,
+                                                   allow_free_text=True)
+        self.signataire_combo.pack(side="left")
+        self.signataire_combo.bind("<<ComboboxSelected>>", self._on_signataire_selected)
+
+        for lbl, var, cls in [("Courriel du signataire", self.email_sig_var,  EmailEntry),
+                               ("Telephone signataire",   self.tel_sig_var,    ttk.Entry)]:
+            r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=2)
             tk.Label(r, text=lbl, bg=C["bg"], font=("Arial",10),
                      width=24, anchor="e").pack(side="left", padx=(0,8))
             cls(r, textvariable=var, width=46).pack(side="left")
@@ -5529,11 +6015,20 @@ class BonDialog(tk.Toplevel):
         tk.Label(p, text="  Demandeur (personne ayant appele)",
                  bg=C["bg"], font=("Arial", 9, "italic"),
                  fg="#6b7785").pack(anchor="w", padx=20, pady=(8, 2))
-        for lbl, var, cls in [("Nom du demandeur",        self.demandeur_var,    ttk.Entry),
-                              ("Courriel du demandeur",   self.email_demand_var, EmailEntry),
-                              ("Telephone du demandeur",  self.tel_demand_var,   ttk.Entry)]:
-            r = tk.Frame(p, bg=C["bg"])
-            r.pack(fill="x", padx=20, pady=2)
+
+        # Nom du demandeur — SearchableCombobox
+        r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=2)
+        tk.Label(r, text="Nom du demandeur", bg=C["bg"], font=("Arial",10),
+                 width=24, anchor="e").pack(side="left", padx=(0,8))
+        self.demandeur_combo = SearchableCombobox(r, textvariable=self.demandeur_var,
+                                                  values=contact_noms, width=44,
+                                                  allow_free_text=True)
+        self.demandeur_combo.pack(side="left")
+        self.demandeur_combo.bind("<<ComboboxSelected>>", self._on_demandeur_selected)
+
+        for lbl, var, cls in [("Courriel du demandeur",   self.email_demand_var, EmailEntry),
+                               ("Telephone du demandeur",  self.tel_demand_var,   ttk.Entry)]:
+            r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=2)
             tk.Label(r, text=lbl, bg=C["bg"], font=("Arial",10),
                      width=24, anchor="e").pack(side="left", padx=(0,8))
             cls(r, textvariable=var, width=46).pack(side="left")
@@ -5561,6 +6056,19 @@ class BonDialog(tk.Toplevel):
             mk_btn(row2, "+", lambda: MoteurDialog(self, self.app, on_save=self._reload_refs),
                    color=C["btn2"]).pack(side="left", padx=(8,0))
 
+        # Navire/Site — combobox interactive (filtre les N° Série disponibles)
+        r_nav = tk.Frame(p, bg=C["bg"])
+        r_nav.pack(fill="x", padx=20, pady=2)
+        tk.Label(r_nav, text="Navire / Site", bg=C["bg"], font=("Arial",10),
+                 width=24, anchor="e").pack(side="left", padx=(0,8))
+        self.navire_var = tk.StringVar()
+        _all_navires = sorted({row_get(m, "navire", "") for m in self._all_moteurs
+                                if row_get(m, "navire", "")})
+        self.navire_combo = SearchableCombobox(r_nav, textvariable=self.navire_var,
+            values=_all_navires, width=44)
+        self.navire_combo.pack(side="left")
+        self.navire_combo.bind("<<ComboboxSelected>>", self._on_navire_selected)
+
         self._info_lbls = {}
         for key, txt in self.MOTEUR_INFO_FIELDS:
             r = tk.Frame(p, bg=C["bg"])
@@ -5579,12 +6087,28 @@ class BonDialog(tk.Toplevel):
         ttk.Entry(rh, textvariable=self.nb_heures_var, width=20).pack(side="left")
 
         rg = tk.Frame(p, bg=C["bg"]); rg.pack(fill="x", padx=20, pady=2)
-        tk.Label(rg, text="Garanties du moteur", bg=C["bg"], font=("Arial",10),
+        self._garantie_info_row = rg
+        tk.Label(rg, text="Garantie constructeur", bg=C["bg"], font=("Arial",10),
                  width=24, anchor="e").pack(side="left", padx=(0,8))
         self.garantie_lbl = tk.Label(rg, text="—", bg="#eef2f7", font=("Arial",9),
                                       anchor="w", relief="groove", padx=6,
                                       justify="left")
         self.garantie_lbl.pack(side="left", fill="x", expand=True, ipady=3)
+
+        # Lier l'intervention à une garantie en cours (affiché dynamiquement)
+        self.garantie_lien_var = tk.StringVar()
+        self._garanties_ouvertes = []
+        self._garanties_by_num = {}
+        self._all_garanties_moteur = []
+        self._garantie_lien_frame = tk.Frame(p, bg=C["bg"])
+        tk.Label(self._garantie_lien_frame, text="Demande de garantie", bg=C["bg"],
+                 font=("Arial", 10), width=24, anchor="e").pack(side="left", padx=(0, 8))
+        self._garantie_lien_combo = ttk.Combobox(
+            self._garantie_lien_frame, textvariable=self.garantie_lien_var,
+            values=[], width=44, state="readonly")
+        self._garantie_lien_combo.pack(side="left")
+        self._garantie_lien_combo.bind("<<ComboboxSelected>>",
+                                       self._on_garantie_lien_selected)
 
         # ── MOTEURS SUPPLÉMENTAIRES ───────────────────────────────────────────
         self._extra_moteurs_rows = []
@@ -5850,10 +6374,15 @@ class BonDialog(tk.Toplevel):
             self._clients     = refs.get("clients", [])
             self._all_moteurs = refs.get("moteurs", [])
             self._techniciens = refs.get("techniciens", [])
+            self._contacts    = []
         else:
             self._clients     = list(db.get_clients())
             self._all_moteurs = list(db.get_moteurs())
             self._techniciens = list(db.get_techniciens())
+            try:
+                self._contacts = list(db.get_contacts())
+            except Exception:
+                self._contacts = []
         self._client_by_id  = {c["id"]:  c for c in self._clients}
         self._client_by_nom = {c["nom"]: c for c in self._clients}
         self._moteur_by_id  = {m["id"]:  m for m in self._all_moteurs}
@@ -5861,6 +6390,10 @@ class BonDialog(tk.Toplevel):
 
         self.client_combo.set_values([c["nom"] for c in self._clients])
         self.tech_picker.set_available([t["nom"] for t in self._techniciens])
+        contact_noms = [c["nom"] for c in self._contacts]
+        self._contact_by_nom = {c["nom"]: c for c in self._contacts}
+        self.signataire_combo.set_values(contact_noms)
+        self.demandeur_combo.set_values(contact_noms)
         cli = self._client_by_nom.get(old_client)
         filtrés = ([m for m in self._all_moteurs if m["client_id"] == cli["id"]]
                    if cli else self._all_moteurs)
@@ -5881,11 +6414,14 @@ class BonDialog(tk.Toplevel):
         client = self._client_by_nom.get(self.client_var.get())
         if client:
             if not self.signataire_var.get():
-                self.signataire_var.set(row_get(client, "contact"))
+                self.signataire_combo.set(row_get(client, "contact"))
             if not self.email_sig_var.get():
                 self.email_sig_var.set(row_get(client, "email"))
         filtres = self._moteurs_filtres()
         series = [m["num_serie"] for m in filtres]
+        navires = sorted({row_get(m, "navire", "") for m in filtres if row_get(m, "navire", "")})
+        self.navire_combo.set_values(navires)
+        self.navire_var.set("")
         self.moteur_combo.set_values(series)
         self.moteur_var.set("")
         for lw in self._info_lbls.values():
@@ -5900,6 +6436,38 @@ class BonDialog(tk.Toplevel):
             if "gar_lbl" in e:
                 e["gar_lbl"].config(text="—", fg="black")
 
+    def _on_signataire_selected(self, *_):
+        c = self._contact_by_nom.get(self.signataire_var.get())
+        if c:
+            if not self.email_sig_var.get():
+                self.email_sig_var.set(c.get("email", ""))
+            if not self.tel_sig_var.get():
+                self.tel_sig_var.set(c.get("telephone", ""))
+
+    def _on_demandeur_selected(self, *_):
+        c = self._contact_by_nom.get(self.demandeur_var.get())
+        if c:
+            if not self.email_demand_var.get():
+                self.email_demand_var.set(c.get("email", ""))
+            if not self.tel_demand_var.get():
+                self.tel_demand_var.set(c.get("telephone", ""))
+
+    def _on_navire_selected(self, *_):
+        navire = self.navire_var.get()
+        if not navire:
+            return
+        filtres = [m for m in self._moteurs_filtres() if row_get(m, "navire", "") == navire]
+        series = [m["num_serie"] for m in filtres]
+        self.moteur_combo.set_values(series)
+        if len(filtres) == 1:
+            self.moteur_var.set(filtres[0]["num_serie"])
+            self._on_moteur_selected()
+        else:
+            self.moteur_var.set("")
+            for lw in self._info_lbls.values():
+                lw.config(text="")
+            self.garantie_lbl.config(text="—", fg="black")
+
     def _on_moteur_selected(self, *_):
         m = self._moteur_by_ns.get(self.moteur_var.get())
         if m:
@@ -5909,14 +6477,40 @@ class BonDialog(tk.Toplevel):
                 c = self._client_by_id.get(m["client_id"])
                 if c:
                     self.client_combo.set(c["nom"])
+                    # Mettre à jour le navire combo selon les moteurs du client
+                    client_moteurs = [mot for mot in self._all_moteurs
+                                      if mot["client_id"] == c["id"]]
+                    navires = sorted({row_get(mot, "navire", "") for mot in client_moteurs
+                                      if row_get(mot, "navire", "")})
+                    self.navire_combo.set_values(navires)
                     if not self.signataire_var.get():
-                        self.signataire_var.set(row_get(c, "contact"))
+                        self.signataire_combo.set(row_get(c, "contact"))
                     if not self.email_sig_var.get():
                         self.email_sig_var.set(row_get(c, "email"))
 
     def _set_moteur_info(self, m):
+        self.navire_combo.set(str(row_get(m, "navire", "")))
         for key, lw in self._info_lbls.items():
             lw.config(text=str(row_get(m, key, "")))
+
+        # ── Statut garantie constructeur (date_mise_service + duree_garantie) ──
+        gstat, gjours = db.garantie_status(
+            row_get(m, "date_mise_service", ""),
+            row_get(m, "duree_garantie", ""))
+        if gstat == "Active":
+            self.garantie_lbl.config(
+                text=f"✅ Garantie constructeur ACTIVE — {gjours} jour(s) restant(s)",
+                fg="#0f5132")
+        elif gstat == "Expiree":
+            self.garantie_lbl.config(
+                text=f"⛔ Garantie constructeur expirée (il y a {gjours} jour(s))",
+                fg="#b91c1c")
+        else:
+            self.garantie_lbl.config(
+                text="—  (aucune garantie constructeur renseignée)",
+                fg="#666")
+
+        # ── Demandes de garantie (dossiers app garanties) ────────────────────
         if self.is_offline:
             gars = []
         else:
@@ -5924,25 +6518,41 @@ class BonDialog(tk.Toplevel):
                 gars = db.get_garanties_moteur(row_get(m, "id"))
             except Exception:
                 gars = []
-        if not gars:
-            self.garantie_lbl.config(
-                text="—  (aucune garantie enregistrée pour ce moteur)",
-                fg="#666")
+
+        self._all_garanties_moteur = gars
+        ouvertes = [g for g in gars if g["statut"] != "Clôturée"]
+        self._garanties_ouvertes = ouvertes
+        self._garanties_by_num = {g["num_ems"]: g for g in ouvertes}
+
+        if ouvertes:
+            labels = ["— Aucune (ne pas lier)"] + [
+                f"{g['num_ems']} · {g['attribution']} · {g['statut']}"
+                for g in ouvertes
+            ]
+            self._garantie_lien_combo.config(values=labels)
+            cur = self.garantie_lien_var.get()
+            if not cur or cur not in labels:
+                self.garantie_lien_var.set("— Aucune (ne pas lier)")
+            self._garantie_lien_frame.pack(fill="x", padx=20, pady=2,
+                                           after=self._garantie_info_row)
         else:
-            ouvertes = [g for g in gars if g["statut"] != "Clôturée"]
-            if ouvertes:
-                parts = [
-                    f"{g['num_ems']} · {g['attribution']} · {g['statut']}"
-                    for g in ouvertes[:3]
-                ]
-                txt = "🛡 " + "   |   ".join(parts)
-                if len(ouvertes) > 3:
-                    txt += f"   (+{len(ouvertes) - 3} autre(s))"
-                self.garantie_lbl.config(text=txt, fg="#0f5132")
-            else:
-                self.garantie_lbl.config(
-                    text=f"🛡 {len(gars)} garantie(s) — toutes clôturées",
-                    fg="#666")
+            self._garantie_lien_frame.pack_forget()
+            self.garantie_lien_var.set("")
+
+    def _on_garantie_lien_selected(self, *_):
+        sel = self.garantie_lien_var.get()
+        if sel and sel != "— Aucune (ne pas lier)":
+            self.chk["garantie_intervention"].set(1)
+            num_ems = sel.split(" · ")[0] if " · " in sel else sel
+            g = self._garanties_by_num.get(num_ems)
+            if g and not self.demandeur_var.get():
+                nom = row_get(g, "nom_demandeur")
+                if nom:
+                    self.demandeur_combo.set(nom)
+                    if not self.email_demand_var.get():
+                        self.email_demand_var.set(row_get(g, "email_demandeur"))
+                    if not self.tel_demand_var.get():
+                        self.tel_demand_var.set(row_get(g, "telephone_demandeur"))
 
     # ─── Moteurs supplémentaires ─────────────────────────────────────────────
     def _add_moteur_row(self, initial_ns="", initial_nb_heures=""):
@@ -6331,10 +6941,10 @@ class BonDialog(tk.Toplevel):
         if c:
             self.client_combo.set(c["nom"])
         self.lieu_var.set(row_get(inv, "lieu_intervention"))
-        self.signataire_var.set(row_get(inv, "nom_signataire"))
+        self.signataire_combo.set(row_get(inv, "nom_signataire"))
         self.email_sig_var.set(row_get(inv, "email_signataire"))
         self.tel_sig_var.set(row_get(inv, "telephone_signataire"))
-        self.demandeur_var.set(row_get(inv, "nom_demandeur"))
+        self.demandeur_combo.set(row_get(inv, "nom_demandeur"))
         self.email_demand_var.set(row_get(inv, "email_demandeur"))
         self.tel_demand_var.set(row_get(inv, "telephone_demandeur"))
 
@@ -6342,11 +6952,32 @@ class BonDialog(tk.Toplevel):
             filtrés = [m for m in self._all_moteurs if m["client_id"] == c["id"]]
         else:
             filtrés = self._all_moteurs
+        navires_load = sorted({row_get(m, "navire", "") for m in filtrés if row_get(m, "navire", "")})
+        self.navire_combo.set_values(navires_load)
         self.moteur_combo.set_values([m["num_serie"] for m in filtrés])
         m = self._moteur_by_id.get(row_get(inv, "moteur_id"))
         if m:
             self.moteur_combo.set(m["num_serie"])
             self._set_moteur_info(m)
+            # Pré-sélectionner la garantie déjà liée à cette intervention
+            if not self.is_offline and self.inv_id:
+                linked = next(
+                    (g for g in self._all_garanties_moteur
+                     if g.get("intervention_id") == self.inv_id),
+                    None
+                )
+                if linked:
+                    lbl = f"{linked['num_ems']} · {linked['attribution']} · {linked['statut']}"
+                    vals = list(self._garantie_lien_combo.cget("values"))
+                    if lbl not in vals:
+                        # Garantie clôturée mais liée — on l'ajoute pour affichage
+                        vals = (vals if vals else ["— Aucune (ne pas lier)"]) + [lbl]
+                        self._garantie_lien_combo.config(values=vals)
+                        self._garanties_by_num[linked["num_ems"]] = linked
+                        self._garantie_lien_frame.pack(
+                            fill="x", padx=20, pady=2,
+                            after=self._garantie_info_row)
+                    self.garantie_lien_var.set(lbl)
         self.nb_heures_var.set(row_get(inv, "nb_heures_fct"))
         self.num_cmd_var.set(row_get(inv, "num_commande_client"))
         self.type_var.set(row_get(inv, "type_intervention"))
@@ -6581,16 +7212,47 @@ class BonDialog(tk.Toplevel):
                 "Importez le fichier en ligne pour synchroniser avec le serveur.")
             return
 
-        if self.is_edit:
-            db.update_intervention(self.inv_id, data)
-            num_bon = db.get_intervention(inv_id=self.inv_id)["num_bon"]
-        else:
-            iid, num_bon = db.create_intervention(data)
-            self.inv_id = iid
-            self.is_edit = True
+        try:
+            if self.is_edit:
+                db.update_intervention(self.inv_id, data)
+                num_bon = db.get_intervention(inv_id=self.inv_id)["num_bon"]
+            else:
+                iid, num_bon = db.create_intervention(data)
+                self.inv_id = iid
+                self.is_edit = True
+        except Exception as exc:
+            messagebox.showerror("Erreur d'enregistrement",
+                f"Impossible d'enregistrer le bon :\n\n{exc}")
+            return
+
+        # Lier la garantie sélectionnée à cette intervention
+        if not self.is_offline:
+            sel_lbl = self.garantie_lien_var.get()
+            sel_gar = None
+            for num, g in self._garanties_by_num.items():
+                if sel_lbl.startswith(num):
+                    sel_gar = g
+                    break
+            if sel_gar:
+                try:
+                    db.update_garantie(sel_gar["id"], {"intervention_id": self.inv_id})
+                except Exception as exc:
+                    messagebox.showwarning("Liaison garantie",
+                        f"Bon enregistré, mais impossible de lier la garantie :\n{exc}")
 
         if self.on_save:
             self.on_save()
+
+        # Rafraîchir la liste des contacts après save (intègre les nouveaux noms)
+        if not self.is_offline:
+            try:
+                self._contacts = list(db.get_contacts())
+                contact_noms = [c["nom"] for c in self._contacts]
+                self._contact_by_nom = {c["nom"]: c for c in self._contacts}
+                self.signataire_combo.set_values(contact_noms)
+                self.demandeur_combo.set_values(contact_noms)
+            except Exception:
+                pass
 
         if generer:
             dossier = self._current_dossier()
