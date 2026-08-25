@@ -4,7 +4,9 @@ Outil de suivi des interventions et demandes clients
 Version 1.8 – Tableau de bord modulable, urgence, classifications, heure Paris
 """
 
+import csv
 import json
+import re
 import shutil
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -15,6 +17,7 @@ from ems_client import api as db
 from shared import mailer
 from shared import csv_importer
 from shared.bon_generator import sauvegarder_bon, ouvrir_fichier, apply_icon
+from shared.version import __version__
 
 
 def _check_api_startup():
@@ -65,8 +68,8 @@ def _dossiers_root() -> Path:
                 pass
             break
     
-    # Defaut : sous-dossier 'dossiers' a cote de l'exe/script
-    p = base_default / "dossiers"
+    # Defaut : sous-dossier 'DOSSIER-INTERVENTION-DEVIS' a cote de l'exe/script
+    p = base_default / "DOSSIER-INTERVENTION-DEVIS"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -80,6 +83,26 @@ def _dossiers_root_garanties() -> Path:
         p = Path(__file__).resolve().parent / "garanties"
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+
+def _dossiers_root_ameliorations() -> Path:
+    """Dossier racine des fiches d'amélioration (même logique que amelioration_generator)."""
+    try:
+        from amelioration_generator import AMELIO_DIR
+        return AMELIO_DIR
+    except Exception:
+        p = Path(__file__).resolve().parent / "ameliorations"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
+def _ouvrir_dossier_securise(path):
+    """Ouvre un dossier avec l'explorateur système, en signalant les erreurs à
+    l'utilisateur au lieu de les laisser échouer silencieusement."""
+    try:
+        ouvrir_fichier(path)
+    except OSError as e:
+        messagebox.showerror("Dossier", f"Impossible d'ouvrir le dossier :\n{path}\n\n{e}")
 
 
 # ─── Palette ──────────────────────────────────────────────────────────────────
@@ -131,6 +154,14 @@ C = {
 }
 STATUTS  = ["En cours", "Date à programmer", "À facturer", "Facturé", "Clos"]
 URGENCES = ["Normale", "Urgente", "Critique"]
+STATUTS_DEVIS = ["Brouillon", "Envoyé", "Accepté", "Refusé", "Transformé"]
+CONDITIONS_REGLEMENT = [
+    "Comptant à la commande",
+    "30 % à la commande, solde à réception de facture",
+    "30 % à la commande, solde à 30 jours fin de mois",
+    "Solde à réception de facture, 30 jours date de facture",
+    "50 % à la commande, solde à la livraison",
+]
 
 # Polices unifiées (Tkinter accepte des tuples ou un nom de famille)
 F = {
@@ -266,6 +297,31 @@ def fill_tree(tree, rows, urgences=None):
         tree.insert("", "end", iid=str(i), values=r, tags=tuple(tags))
 
 
+def export_rows_to_csv(parent, default_name, headers, rows):
+    """Exporte des lignes vers un fichier CSV choisi par l'utilisateur."""
+    if not rows:
+        messagebox.showinfo("Export", "Aucune donnée à exporter.")
+        return
+    path = filedialog.asksaveasfilename(
+        parent=parent,
+        title="Exporter vers un fichier CSV",
+        defaultextension=".csv",
+        initialfile=default_name,
+        filetypes=[("Fichier CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+    )
+    if not path:
+        return
+    try:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(headers)
+            writer.writerows(rows)
+        messagebox.showinfo("Export réussi",
+                             f"✅ {len(rows)} ligne(s) exportée(s).\n\n{path}")
+    except Exception as e:
+        messagebox.showerror("Erreur d'export", str(e))
+
+
 def section_bar(parent, title):
     """Titre de section avec underline coloré (plus discret que bandeau bleu plein)."""
     wrapper = tk.Frame(parent, bg=C["bg"])
@@ -276,6 +332,20 @@ def section_bar(parent, title):
     # Ligne fine accent rouge sous le titre
     line = tk.Frame(parent, bg=C["accent"], height=2)
     line.pack(fill="x", padx=2)
+
+
+def scrolled_text(parent, height, padx=20, pady=(4, 4)):
+    """Zone de texte multi-lignes avec ascenseur vertical, pour garder le début
+    du texte accessible quand le contenu dépasse la hauteur visible."""
+    wrapper = tk.Frame(parent, bg=C["bg"])
+    wrapper.pack(fill="x", padx=padx, pady=pady)
+    txt = tk.Text(wrapper, height=height, font=("Arial", 10), wrap="word",
+                  relief="solid", bd=1, padx=6, pady=4)
+    vsb = ttk.Scrollbar(wrapper, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=vsb.set)
+    txt.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+    return txt
 
 
 def notif_icon(client_notifie, tech_notifie):
@@ -960,10 +1030,10 @@ class TechniciensPicker(tk.Frame):
 class AppEMS(tk.Tk):
     # Onglets visibles selon le mode de l'application
     NAV_PARELEMENTS = {
-        "bons": ["dashboard", "interventions", "import_export", "nouveau"],
-        "parc": ["clients", "moteurs", "techniciens"],
-        "full": ["dashboard", "interventions", "clients",
-                 "moteurs", "techniciens", "import_export", "nouveau"],
+        "bons": ["dashboard", "interventions", "devis", "import_export", "nouveau"],
+        "parc": ["clients", "moteurs", "contacts", "techniciens"],
+        "full": ["dashboard", "interventions", "devis", "clients",
+                 "moteurs", "contacts", "techniciens", "import_export", "nouveau"],
     }
     TITRES = {
         "bons": "EMS – Bons d'intervention",
@@ -977,7 +1047,7 @@ class AppEMS(tk.Tk):
         apply_icon(self)
         self.mode = mode if mode in self.NAV_PARELEMENTS else "full"
         self._onglets_actifs = self.NAV_PARELEMENTS[self.mode]
-        self.title(self.TITRES[self.mode])
+        self.title(f"{self.TITRES[self.mode]}  v{__version__}")
         self.geometry("1340x830")
         self.minsize(960, 620)
         self.configure(bg=C["bg"])
@@ -1199,8 +1269,10 @@ class AppEMS(tk.Tk):
         for key, icon, lbl in [
             ("dashboard",     "📊", "Tableau de bord"),
             ("interventions", "🔧", "Interventions"),
+            ("devis",         "📋", "Devis"),
             ("clients",       "👥", "Clients"),
             ("moteurs",       "⚙",  "Moteurs"),
+            ("contacts",      "📇", "Contacts"),
             ("techniciens",   "🔨", "Techniciens"),
             ("import_export", "🔄", "Import / Export"),
             ("nouveau",       "➕", "Nouveau bon"),
@@ -1279,8 +1351,10 @@ class AppEMS(tk.Tk):
         for FrameCls, key in [
             (DashboardFrame,      "dashboard"),
             (InterventionsFrame,  "interventions"),
+            (DevisFrame,          "devis"),
             (ClientsFrame,        "clients"),
             (MoteursFrame,        "moteurs"),
+            (ContactsFrame,       "contacts"),
             (TechniciensFrame,    "techniciens"),
             (ImportExportFrame,   "import_export"),
             (NouveauFrame,        "nouveau"),
@@ -2364,6 +2438,8 @@ class ClientsFrame(tk.Frame):
         ttk.Entry(sf, textvariable=self.search_var, width=30).pack(side="left", padx=4)
         mk_btn(sf, "➕ Nouveau client",
                lambda: ClientDialog(self, self.app, on_save=self.refresh)).pack(side="right")
+        mk_btn(sf, "📤 Exporter", self._exporter,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
 
         cols = ("nom","contact","email","telephone","adresse")
         col_defs = [("nom","Nom",200),("contact","Contact",140),
@@ -2405,6 +2481,12 @@ class ClientsFrame(tk.Frame):
         if r and messagebox.askyesno("Supprimer", f"Supprimer '{r['nom']}' ?"):
             db.delete_client(r["id"]); self.refresh()
 
+    def _exporter(self):
+        headers = ["Nom", "Contact", "Email", "Téléphone", "Adresse"]
+        rows = [(c["nom"], c["contact"], c["email"], c["telephone"], c["adresse"])
+                for c in self._cache]
+        export_rows_to_csv(self, "clients.csv", headers, rows)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MOTEURS
@@ -2433,14 +2515,17 @@ class MoteursFrame(tk.Frame):
         mk_btn(sf, "📥 Importer CSV",
                lambda: ImportCSVDialog(self, self.app, on_save=self.refresh),
                color=C["btn2"]).pack(side="right", padx=(0, 6))
+        mk_btn(sf, "📤 Exporter", self._exporter,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
 
-        cols = ("num_serie","client","navire","marque","machine","type_moteur","date","garantie","statut_g")
+        cols = ("num_serie","client","navire","marque","machine","type_moteur","date","garantie","statut_g","affaire")
         col_defs = [("num_serie","N° Série",125),("client","Client",140),
                     ("navire","Navire/Site",120),
                     ("marque","Marque",90),
                     ("machine","Machine",100),
                     ("type_moteur","Type moteur",115),("date","Mise en service",105),
-                    ("garantie","Mois",50, "center"),("statut_g","Garantie",115)]
+                    ("garantie","Mois",50, "center"),("statut_g","Garantie",115),
+                    ("affaire","Affaire",110, "center")]
         tf, self.tree = mk_tree(self, cols, col_defs, height=22, show_tree=True)
         tf.pack(fill="both", expand=True, padx=20, pady=4)
 
@@ -2449,6 +2534,10 @@ class MoteursFrame(tk.Frame):
         mk_btn(af, "✏️ Modifier", self._modifier).pack(side="left", padx=4)
         mk_btn(af, "📋 Fiche & historique", self._voir_inv).pack(side="left", padx=4)
         mk_btn(af, "➕ Sous-ensemble", self._se_add,
+               color=C["btn2"]).pack(side="left", padx=4)
+        mk_btn(af, "🔗 Assigner à…", self._se_assign,
+               color=C["btn2"]).pack(side="left", padx=4)
+        mk_btn(af, "🔓 Détacher", self._se_detach,
                color=C["btn2"]).pack(side="left", padx=4)
         self.btn_suppr = mk_btn(af, "🗑️ Supprimer",
                                  self._supprimer, color=C["danger"])
@@ -2469,10 +2558,12 @@ class MoteursFrame(tk.Frame):
         if statut == "Active":   gtxt = f"Active · {jours}j"
         elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
         else: gtxt = "—"
+        code_affaire = m.get("code_affaire", "")
+        atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") and code_affaire else "—"
         return (m.get("num_serie", ""), m.get("client_nom", "") or "",
                 row_get(m, "navire"), row_get(m, "marque"), row_get(m, "machine"),
                 row_get(m, "type_moteur"), m.get("date_mise_service", ""),
-                m.get("duree_garantie", ""), gtxt)
+                m.get("duree_garantie", ""), gtxt, atxt)
 
     def refresh(self):
         ms = db.get_moteurs(search=self.search_var.get(),
@@ -2489,7 +2580,7 @@ class MoteursFrame(tk.Frame):
                 # Nœud factice : juste pour afficher la flèche ▶, remplacé
                 # par les vrais sous-ensembles au premier déploiement.
                 self.tree.insert(m["id"], "end",
-                                  values=("⏳ chargement…", "", "", "", "", "", "", "", ""))
+                                  values=("⏳ chargement…", "", "", "", "", "", "", "", "", ""))
 
     def _on_tree_open(self, _ev=None):
         iid = self.tree.focus()
@@ -2506,7 +2597,7 @@ class MoteursFrame(tk.Frame):
             print(f"[MoteursFrame] sous-ensembles : {e}")
         if not children:
             self.tree.insert(parent_id, "end",
-                              values=("(aucun sous-ensemble)", "", "", "", "", "", "", "", ""))
+                              values=("(aucun sous-ensemble)", "", "", "", "", "", "", "", "", ""))
             return
         for j, se in enumerate(children):
             self._by_id[se["id"]] = se
@@ -2542,6 +2633,62 @@ class MoteursFrame(tk.Frame):
                 self.tree.item(r["id"], open=True)
                 self._load_children(r["id"])
         MoteurDialog(self, self.app, parent_moteur=r, on_save=_after_save)
+
+    def _se_assign(self):
+        """Rattache le moteur sélectionné (déjà saisi) comme sous-ensemble
+        d'un autre moteur, choisi a posteriori — permet de pré-saisir des
+        moteurs à part et de les affecter en temps voulu."""
+        r = self._sel()
+        if not r:
+            return
+        if r.get("nb_sous_ensembles", 0) > 0:
+            messagebox.showwarning(
+                "Assignation",
+                "Ce moteur possède déjà ses propres sous-ensembles ; "
+                "il ne peut pas devenir sous-ensemble d'un autre moteur.")
+            return
+        cibles = [m for m in self._cache if m["id"] != r["id"]]
+        if not cibles:
+            messagebox.showinfo("Assignation", "Aucun autre moteur disponible.")
+            return
+        parent_actuel = r.get("parent_moteur_id")
+
+        def _choisi(cible):
+            try:
+                db.update_moteur(r["id"], {"parent_moteur_id": cible["id"]})
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e))
+                return
+            self.refresh()
+            if self.tree.exists(cible["id"]):
+                self.tree.item(cible["id"], open=True)
+                self._load_children(cible["id"])
+
+        titre = (f"Réassigner « {r.get('num_serie', '')} » comme sous-ensemble de :"
+                 if parent_actuel else
+                 f"Assigner « {r.get('num_serie', '')} » comme sous-ensemble de :")
+        ChoisirMoteurDialog(self, self.app, cibles, titre, _choisi)
+
+    def _se_detach(self):
+        """Détache le moteur sélectionné de son moteur principal : il
+        redevient un moteur indépendant dans la liste principale."""
+        r = self._sel()
+        if not r:
+            return
+        if not r.get("parent_moteur_id"):
+            messagebox.showinfo("Détacher", "Ce moteur n'est pas un sous-ensemble.")
+            return
+        if not messagebox.askyesno(
+                "Détacher",
+                f"Détacher « {r.get('num_serie', '')} » de son moteur principal ?\n\n"
+                "Il redeviendra un moteur indépendant."):
+            return
+        try:
+            db.update_moteur(r["id"], {"parent_moteur_id": None})
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e))
+            return
+        self.refresh()
 
     def _sel(self):
         """Premier élément sélectionné (moteur ou sous-ensemble)."""
@@ -2598,17 +2745,56 @@ class MoteursFrame(tk.Frame):
             try:
                 db.delete_moteur(m["id"])
             except Exception as e:
-                echecs.append(f"{m['num_serie']} : {e}")
+                echecs.append((m, str(e)))
         self.refresh()
-        if echecs:
+        # Une erreur réseau (timeout, connexion coupée en cours de réponse…)
+        # ne veut pas forcément dire que la suppression a échoué côté serveur :
+        # on vérifie l'état réel après rafraîchissement avant d'alarmer, plutôt
+        # que de se fier uniquement à l'exception levée par l'appel HTTP.
+        echecs_reels = [(m, err) for m, err in echecs if m["id"] in self._by_id]
+        if echecs_reels:
             messagebox.showerror(
                 "Suppression partielle",
-                f"{n - len(echecs)}/{n} moteurs supprimés.\n\n"
-                "Échecs :\n" + "\n".join(echecs[:10]))
+                f"{n - len(echecs_reels)}/{n} moteurs supprimés.\n\n"
+                "Échecs :\n" + "\n".join(f"{m['num_serie']} : {err}"
+                                          for m, err in echecs_reels[:10]))
         else:
             messagebox.showinfo(
                 "Suppression effectuée",
                 f"✅ {n} moteur(s) supprimé(s).")
+
+    def _export_row_values(self, m):
+        statut, jours = db.garantie_status(m.get("date_mise_service", ""),
+                                            m.get("duree_garantie", ""))
+        if statut == "Active":   gtxt = f"Active · {jours}j"
+        elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
+        else: gtxt = "—"
+        code_affaire = m.get("code_affaire", "")
+        atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") and code_affaire else "—"
+        return (
+            row_get(m, "num_serie"), row_get(m, "client_nom"),
+            row_get(m, "navire"), row_get(m, "navire_immatriculation"),
+            row_get(m, "navire_port_attache"), row_get(m, "machine"),
+            row_get(m, "marque"), row_get(m, "type_moteur"),
+            row_get(m, "ref_constructeur"), row_get(m, "application"),
+            row_get(m, "typologie"), row_get(m, "puissance_rpm"),
+            row_get(m, "puissance_pme_rpm"), code_affaire,
+            row_get(m, "date_mise_service"), row_get(m, "duree_garantie"),
+            gtxt, atxt,
+            row_get(m, "client_utilisateur_nom"), row_get(m, "client_utilisateur_email"),
+            row_get(m, "client_utilisateur_tel"), row_get(m, "client_utilisateur_adresse"),
+        )
+
+    def _exporter(self):
+        headers = ["N° Série", "Client", "Navire/Site", "Immatriculation navire",
+                   "Port d'attache", "Machine", "Marque", "Type moteur / inverseur",
+                   "Réf. Constructeur", "Application", "Typologie",
+                   "Puissance/RPM", "Puissance PME/RPM", "Code Affaire",
+                   "Mise en service", "Garantie (mois)", "Statut garantie", "Affaire",
+                   "Client utilisateur", "Email utilisateur", "Tél. utilisateur",
+                   "Adresse utilisateur"]
+        rows = [self._export_row_values(m) for m in self._cache]
+        export_rows_to_csv(self, "moteurs.csv", headers, rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2624,6 +2810,8 @@ class TechniciensFrame(tk.Frame):
         sf.pack(fill="x", padx=20, pady=8)
         mk_btn(sf, "➕ Nouveau technicien",
                lambda: TechnicienDialog(self, self.app, on_save=self.refresh)).pack(side="right")
+        mk_btn(sf, "📤 Exporter", self._exporter,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
 
         # Alignement amélioré : colonnes cadrées à gauche avec padding correct
         cols = ("nom","email","tel","interventions")
@@ -2665,6 +2853,144 @@ class TechniciensFrame(tk.Frame):
         r = self._sel()
         if r and messagebox.askyesno("Supprimer", f"Supprimer '{r['nom']}' ?"):
             db.delete_technicien(r["id"]); self.refresh()
+
+    def _exporter(self):
+        headers = ["Nom", "Email", "Téléphone", "Interventions"]
+        tech_stats = {r["technicien"]: r["total"] for r in db.get_stats_par_technicien()}
+        rows = [(t["nom"], t["email"], t["telephone"], tech_stats.get(t["nom"], 0))
+                for t in self._cache]
+        export_rows_to_csv(self, "techniciens.csv", headers, rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTACTS (signataires / demandeurs)
+# ══════════════════════════════════════════════════════════════════════════════
+class ContactsFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C["bg"])
+        self.app = app
+        mk_header(self, "Contacts", "   Signataires & demandeurs — alimenté automatiquement "
+                                     "par les bons, devis et affaires")
+
+        sf = tk.Frame(self, bg=C["bg"])
+        sf.pack(fill="x", padx=20, pady=8)
+        tk.Label(sf, text="🔍 Recherche :", bg=C["bg"], font=("Arial",10)).pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Entry(sf, textvariable=self.search_var, width=30).pack(side="left", padx=4)
+        mk_btn(sf, "➕ Nouveau contact",
+               lambda: ContactDialog(self, self.app, on_save=self.refresh)).pack(side="right")
+        mk_btn(sf, "📤 Exporter", self._exporter,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
+        mk_btn(sf, "🔎 Détecter doublons", self._detecter_doublons,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
+
+        cols = ("nom","email","telephone","entreprise","usage")
+        col_defs = [("nom","Nom",240),("email","Email",240),
+                    ("telephone","Téléphone",140),("entreprise","Client",180),
+                    ("usage","Utilisations",100,"center")]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=22)
+        tf.pack(fill="both", expand=True, padx=20, pady=4)
+
+        af = tk.Frame(self, bg=C["bg"])
+        af.pack(fill="x", padx=20, pady=8)
+        mk_btn(af, "✏️ Modifier", self._modifier).pack(side="left", padx=4)
+        mk_btn(af, "🗑️ Supprimer", self._supprimer, color=C["danger"]).pack(side="left", padx=4)
+        self.tree.bind("<Double-1>", lambda e: self._modifier())
+        self._cache = []
+
+    def refresh(self):
+        cs = db.get_contacts(search=self.search_var.get())
+        self._cache = list(cs)
+        fill_tree(self.tree, [(c["nom"], c["email"], c["telephone"], c.get("entreprise", ""),
+                                c.get("usage_count", 0))
+                               for c in self._cache])
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection","Sélectionnez un contact."); return None
+        return self._cache[int(sel[0])]
+
+    def _modifier(self):
+        r = self._sel()
+        if r: ContactDialog(self, self.app, dict(r), on_save=self.refresh)
+
+    def _supprimer(self):
+        r = self._sel()
+        if r and messagebox.askyesno("Supprimer", f"Supprimer '{r['nom']}' ?"):
+            db.delete_contact(r["id"]); self.refresh()
+
+    def _exporter(self):
+        headers = ["Nom", "Email", "Téléphone", "Client", "Utilisations"]
+        rows = [(c["nom"], c["email"], c["telephone"], c.get("entreprise", ""), c.get("usage_count", 0))
+                for c in self._cache]
+        export_rows_to_csv(self, "contacts.csv", headers, rows)
+
+    @staticmethod
+    def _norm_email(v):
+        v = (v or "").strip().lower()
+        return v or None
+
+    @staticmethod
+    def _norm_tel(v):
+        digits = re.sub(r"\D", "", v or "")
+        # ignore trop court pour éviter les faux positifs (champs vides, "0", etc.)
+        return digits if len(digits) >= 6 else None
+
+    def _detecter_doublons(self):
+        contacts = list(db.get_contacts(search=""))
+        if len(contacts) < 2:
+            messagebox.showinfo("Doublons", "Pas assez de contacts pour détecter des doublons.")
+            return
+
+        # Union-find : deux contacts sont liés s'ils partagent le même email ou le même téléphone normalisé.
+        parent = {c["id"]: c["id"] for c in contacts}
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for field, norm_fn in (("email", self._norm_email), ("telephone", self._norm_tel)):
+            buckets = {}
+            for c in contacts:
+                k = norm_fn(c.get(field, ""))
+                if k:
+                    buckets.setdefault(k, []).append(c["id"])
+            for ids in buckets.values():
+                for other in ids[1:]:
+                    union(ids[0], other)
+
+        groups = {}
+        for c in contacts:
+            groups.setdefault(find(c["id"]), []).append(c)
+        dup_groups = [g for g in groups.values() if len(g) > 1]
+
+        if not dup_groups:
+            messagebox.showinfo("Doublons", "Aucun doublon détecté (email / téléphone).")
+            return
+
+        self._resoudre_doublons(dup_groups)
+
+    def _resoudre_doublons(self, dup_groups):
+        if not dup_groups:
+            self.refresh()
+            messagebox.showinfo("Doublons", "Traitement des doublons terminé.")
+            return
+        group = dup_groups[0]
+        reste = dup_groups[1:]
+
+        def _on_done():
+            self._resoudre_doublons(reste)
+
+        DoublonContactDialog(self, self.app, group, on_done=_on_done)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3424,9 +3750,13 @@ class AmeliorationsFrame(tk.Frame):
         r = self._sel()
         if not r:
             return
-        d = Path(__file__).parent / "ameliorations" / r["num_ticket"]
-        d.mkdir(parents=True, exist_ok=True)
-        ouvrir_fichier(d)
+        d = _dossiers_root_ameliorations() / r["num_ticket"].upper()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Dossier", f"Impossible de créer le dossier :\n{d}\n\n{e}")
+            return
+        _ouvrir_dossier_securise(d)
 
     def _supprimer(self):
         r = self._sel()
@@ -4254,6 +4584,428 @@ class MaterielsTable(tk.Frame):
         return out
 
 
+def _to_float_devis(s, default=0.0):
+    try:
+        return float(str(s).strip().replace(",", "."))
+    except (ValueError, TypeError):
+        return default
+
+
+class DevisLignesTable(tk.Frame):
+    """Tableau editable pour les lignes chiffrees d'un devis (qte, reference
+    catalogue optionnelle, PU, remise %, montant calcule). Autocomplete de
+    reference identique a MaterielsTable, avec pre-remplissage du prix
+    unitaire depuis le catalogue pieces.
+
+    L'en-tête et le corps sont bâtis sur des cellules de largeur FIXE en
+    pixels (Frame + pack_propagate(False)), et non sur des "width=" en
+    caractères : un tk.Label (en-tête) et un ttk.Entry (corps) n'ont pas la
+    même police/padding par défaut, donc des largeurs en caractères
+    identiques ne donnent jamais la même largeur en pixels — c'est ce qui
+    désalignait P.U. / Remise % / Montant € par rapport à leurs en-têtes."""
+    ROW_H = 26
+    W_QTE, W_REF, W_PU, W_REMISE, W_MONTANT = 50, 160, 80, 80, 95
+    ROW_FONT = ("Arial", 9)
+
+    def __init__(self, master, on_change=None, **kw):
+        super().__init__(master, bg=C["bg"], **kw)
+        self.on_change = on_change
+        self._rows = []
+        self._cache = {}
+        self._ref_to_libelle = {}
+
+        def _cell(parent, w, anchor, expand=False):
+            fkw = {"bg": C["header"], "height": self.ROW_H}
+            if w is not None:
+                fkw["width"] = w
+            cell = tk.Frame(parent, **fkw)
+            cell.pack(side="left", padx=1, fill="x" if expand else None, expand=expand)
+            if not expand:
+                cell.pack_propagate(False)
+            return cell
+
+        self.head = tk.Frame(self, bg=C["header"])
+        self.head.pack(fill="x", pady=(0, 1))
+        head_specs = [
+            ("Qté", self.W_QTE, "w", False),
+            ("Référence", self.W_REF, "w", False),
+            ("Désignation", None, "w", True),
+            ("P.U. €", self.W_PU, "e", False),
+            ("Remise %", self.W_REMISE, "e", False),
+            ("Montant €", self.W_MONTANT, "e", False),
+        ]
+        for lbl, w, anchor, expand in head_specs:
+            cell = _cell(self.head, w, anchor, expand)
+            tk.Label(cell, text=lbl, bg=C["header"], fg="white",
+                     font=("Arial", 9, "bold"), anchor=anchor, padx=4).pack(fill="both", expand=True)
+        # Clone (invisible) du bouton "✕" de suppression de ligne : même police/
+        # padding/relief et même pack(padx=2), pour que la colonne Désignation
+        # (extensible) dispose exactement du même espace résiduel en en-tête et
+        # dans le corps du tableau — sinon même 1-2px d'écart sur ce dernier
+        # élément suffisent à décaler PU / Remise % / Montant € qui suivent.
+        tk.Button(self.head, text="✕", bg=C["header"], fg=C["header"],
+                  font=("Arial", 9, "bold"), relief="flat",
+                  padx=4, pady=0, state="disabled").pack(side="left", padx=2)
+
+        self.body = tk.Frame(self, bg=C["bg"])
+        self.body.pack(fill="x")
+        self.bf = tk.Frame(self, bg=C["bg"])
+        self.bf.pack(fill="x", pady=(4, 0))
+        mk_btn(self.bf, "➕ Ajouter une ligne", self.add_row,
+               color=C["btn2"]).pack(side="left")
+        tk.Label(self.bf, text="  💡 Cliquez sur ▾ ou tapez 2+ caractères "
+                                "pour parcourir le catalogue pièces (prix pré-rempli)",
+                 bg=C["bg"], fg=C["text_muted"],
+                 font=("Arial", 8, "italic")).pack(side="left", padx=(10, 0))
+        for _ in range(2):
+            self.add_row()
+
+    # ── Construction d'une ligne ────────────────────────────────────────────
+    def add_row(self, qte="1", ref="", designation="", pu="", remise="", piece_id=None):
+        rf = tk.Frame(self.body, bg=C["bg"])
+        rf.pack(fill="x", pady=1)
+        v_qte = tk.StringVar(value=qte)
+        v_ref = tk.StringVar(value=ref)
+        v_des = tk.StringVar(value=designation)
+        v_pu = tk.StringVar(value=pu)
+        v_remise = tk.StringVar(value=remise)
+        v_montant = tk.StringVar(value="0,00")
+
+        def _fixed_cell(w):
+            cell = tk.Frame(rf, bg=C["bg"], width=w, height=self.ROW_H)
+            cell.pack(side="left", padx=1)
+            cell.pack_propagate(False)
+            return cell
+
+        qte_cell = _fixed_cell(self.W_QTE)
+        ttk.Entry(qte_cell, textvariable=v_qte, font=self.ROW_FONT).pack(fill="both", expand=True)
+
+        ref_cell = _fixed_cell(self.W_REF)
+        ref_btn = tk.Button(ref_cell, text="▾", font=("Arial", 8),
+                             bg="#e8eef5", fg=C["text"],
+                             relief="solid", bd=1, padx=4, pady=0,
+                             cursor="hand2", activebackground="#d0dceb")
+        ref_btn.pack(side="right", fill="y")
+        ref_entry = ttk.Entry(ref_cell, textvariable=v_ref, font=self.ROW_FONT)
+        ref_entry.pack(side="left", fill="both", expand=True)
+
+        des_cell = tk.Frame(rf, bg=C["bg"], height=self.ROW_H)
+        des_cell.pack(side="left", padx=1, fill="x", expand=True)
+        ttk.Entry(des_cell, textvariable=v_des, font=self.ROW_FONT).pack(fill="both", expand=True)
+
+        pu_cell = _fixed_cell(self.W_PU)
+        ttk.Entry(pu_cell, textvariable=v_pu, justify="right", font=self.ROW_FONT).pack(fill="both", expand=True)
+
+        remise_cell = _fixed_cell(self.W_REMISE)
+        ttk.Entry(remise_cell, textvariable=v_remise, justify="right", font=self.ROW_FONT).pack(fill="both", expand=True)
+
+        montant_cell = _fixed_cell(self.W_MONTANT)
+        tk.Label(montant_cell, textvariable=v_montant, bg=C["bg"], fg=C["text"],
+                 font=("Arial", 9, "bold"), anchor="e", padx=4).pack(fill="both", expand=True)
+
+        row = {"qte": v_qte, "ref": v_ref, "designation": v_des,
+               "pu": v_pu, "remise": v_remise, "montant": v_montant,
+               "piece_id": piece_id,
+               "frame": rf, "ref_entry": ref_entry, "ref_btn": ref_btn,
+               "popup": None, "listbox": None, "after_id": None}
+
+        v_ref.trace_add("write", lambda *_, _r=row: self._on_ref_type(_r))
+        for v in (v_qte, v_pu, v_remise):
+            v.trace_add("write", lambda *_, _r=row: self._recalc_row(_r))
+        ref_btn.config(command=lambda _r=row: self._show_all_or_search(_r))
+        ref_entry.bind("<FocusOut>",
+                        lambda e, _r=row: self.after(150, lambda: self._close_popup(_r)))
+        ref_entry.bind("<Down>", lambda e, _r=row: self._popup_nav(_r, +1) or "break")
+        ref_entry.bind("<Up>", lambda e, _r=row: self._popup_nav(_r, -1) or "break")
+        ref_entry.bind("<Return>", lambda e, _r=row: self._popup_select(_r) or "break")
+        ref_entry.bind("<Escape>", lambda e, _r=row: self._close_popup(_r) or "break")
+
+        tk.Button(rf, text="✕", bg="#ddd", fg=C["danger"],
+                  font=("Arial", 9, "bold"), relief="flat", cursor="hand2",
+                  padx=4, pady=0,
+                  command=lambda r=row: self._remove(r)).pack(side="left", padx=2)
+        self._rows.append(row)
+        self._recalc_row(row)
+
+    # ── AUTOCOMPLETE (identique à MaterielsTable) ───────────────────────────
+    def _on_ref_type(self, row):
+        if row.get("selecting"):
+            return
+        row["piece_id"] = None  # saisie manuelle : on décroche du catalogue
+        if row.get("after_id"):
+            try: self.after_cancel(row["after_id"])
+            except tk.TclError: pass
+            row["after_id"] = None
+        query = row["ref"].get().strip()
+        if len(query) < 2:
+            self._close_popup(row)
+            return
+        row["after_id"] = self.after(200, lambda: self._do_search(row, query))
+
+    def _show_all_or_search(self, row):
+        query = row["ref"].get().strip()
+        if len(query) >= 2:
+            self._do_search(row, query)
+        else:
+            try:
+                pieces = db.get_pieces(search="", limit=20)
+            except Exception:
+                pieces = []
+            self._show_popup(row, pieces)
+        try: row["ref_entry"].focus_set()
+        except tk.TclError: pass
+
+    def _do_search(self, row, query):
+        row["after_id"] = None
+        if row["ref"].get().strip() != query:
+            return
+        if query in self._cache:
+            pieces = self._cache[query]
+        else:
+            try:
+                pieces = db.get_pieces(search=query, limit=20)
+            except Exception:
+                pieces = []
+            self._cache[query] = pieces
+            if len(self._cache) > 200:
+                for k in list(self._cache)[:50]:
+                    del self._cache[k]
+        for p in pieces:
+            r = p.get("reference", "")
+            if r:
+                self._ref_to_libelle[r] = p.get("libelle", "")
+        self._show_popup(row, pieces)
+
+    def _show_popup(self, row, pieces):
+        self._close_popup(row)
+        if not pieces:
+            return
+        entry = row["ref_entry"]
+        try:
+            x = entry.winfo_rootx()
+            y = entry.winfo_rooty() + entry.winfo_height()
+            w = max(480, entry.winfo_width() + 320)
+        except tk.TclError:
+            return
+        h = min(280, 22 * len(pieces) + 26)
+
+        popup = tk.Toplevel(self)
+        popup.wm_overrideredirect(True)
+        try:
+            popup.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        popup.wm_geometry(f"{w}x{h}+{x}+{y}")
+        popup.configure(bg=C["border"])
+
+        tk.Label(popup,
+                 text=f"  {len(pieces)} pièce(s) trouvée(s)"
+                       + ("  (20 max — affinez la recherche)" if len(pieces) >= 20 else ""),
+                 bg=C["header"], fg="white", font=("Arial", 8, "bold"),
+                 anchor="w", padx=6).pack(fill="x")
+
+        frame_list = tk.Frame(popup, bg="white")
+        frame_list.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+        vsb = ttk.Scrollbar(frame_list, orient="vertical")
+        listbox = tk.Listbox(frame_list, font=("Consolas", 9),
+                              bg="white", fg=C["text"],
+                              selectbackground=C["btn"],
+                              selectforeground="white",
+                              activestyle="none", relief="flat",
+                              highlightthickness=0,
+                              yscrollcommand=vsb.set)
+        vsb.config(command=listbox.yview)
+        vsb.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+        for p in pieces:
+            ref = p.get("reference", "")
+            lib = p.get("libelle", "")
+            listbox.insert("end", f" {ref:<22}  {lib}")
+        listbox.selection_set(0)
+        listbox.activate(0)
+        listbox._pieces = pieces
+        row["popup"] = popup
+        row["listbox"] = listbox
+
+        listbox.bind("<ButtonRelease-1>", lambda e, _r=row: (self._popup_select(_r), "break")[1])
+        listbox.bind("<Return>", lambda e, _r=row: self._popup_select(_r))
+        listbox.bind("<Escape>", lambda e, _r=row: self._close_popup(_r))
+
+        def _wheel(ev):
+            listbox.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            return "break"
+        listbox.bind("<MouseWheel>", _wheel)
+        popup.bind("<MouseWheel>", _wheel)
+
+    def _close_popup(self, row):
+        if row.get("popup"):
+            try: row["popup"].destroy()
+            except tk.TclError: pass
+        row["popup"] = None
+        row["listbox"] = None
+
+    def _popup_nav(self, row, delta):
+        lb = row.get("listbox")
+        if not lb:
+            return None
+        try:
+            cur = lb.curselection()
+            cur_idx = cur[0] if cur else 0
+            new_idx = max(0, min(lb.size() - 1, cur_idx + delta))
+            lb.selection_clear(0, "end")
+            lb.selection_set(new_idx)
+            lb.activate(new_idx)
+            lb.see(new_idx)
+        except tk.TclError:
+            pass
+        return True
+
+    def _popup_select(self, row):
+        """Valider la pièce sélectionnée : remplir ref/désignation/piece_id et
+        pré-remplir le PU depuis le catalogue si le champ est vide/à 0."""
+        lb = row.get("listbox")
+        if not lb:
+            return None
+        sel = lb.curselection()
+        if not sel:
+            try:
+                idx = lb.index("active")
+                if idx >= 0:
+                    sel = (idx,)
+            except tk.TclError:
+                pass
+        if not sel:
+            self._close_popup(row)
+            return None
+        try:
+            piece = lb._pieces[sel[0]]
+        except (AttributeError, IndexError):
+            self._close_popup(row)
+            return None
+        ref = piece.get("reference", "")
+        lib = piece.get("libelle", "")
+
+        row["selecting"] = True
+        if row.get("after_id"):
+            try: self.after_cancel(row["after_id"])
+            except tk.TclError: pass
+            row["after_id"] = None
+        row["ref"].set(ref)
+        if lib:
+            row["designation"].set(lib)
+        row["piece_id"] = piece.get("id")
+        if _to_float_devis(row["pu"].get(), 0.0) == 0.0:
+            # Un devis est adressé au client : on préremplit avec le prix de
+            # vente de la pièce (et non son prix d'achat, coût interne), avec
+            # repli sur le prix d'achat si seul celui-ci est renseigné.
+            prix = piece.get("prix_vente", 0) or piece.get("prix_achat", 0) or 0
+            if prix:
+                row["pu"].set(f"{float(prix):g}")
+        self._close_popup(row)
+        self.after(50, lambda: row.update(selecting=False))
+
+        try:
+            row["ref_entry"].tk_focusNext().focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    # ── Calculs ──────────────────────────────────────────────────────────────
+    def _recalc_row(self, row):
+        qte = _to_float_devis(row["qte"].get(), 0.0)
+        pu = _to_float_devis(row["pu"].get(), 0.0)
+        remise = _to_float_devis(row["remise"].get(), 0.0)
+        montant = round(qte * pu * (1 - remise / 100), 2)
+        row["montant"].set(f"{montant:,.2f}".replace(",", " ").replace(".", ","))
+        if self.on_change:
+            try: self.on_change()
+            except Exception: pass
+
+    def total_ht(self):
+        total = 0.0
+        for r in self._rows:
+            qte = _to_float_devis(r["qte"].get(), 0.0)
+            pu = _to_float_devis(r["pu"].get(), 0.0)
+            remise = _to_float_devis(r["remise"].get(), 0.0)
+            total += qte * pu * (1 - remise / 100)
+        return round(total, 2)
+
+    # ── Méthodes existantes ──────────────────────────────────────────────────
+    def _remove(self, row):
+        if len(self._rows) <= 1:
+            row["qte"].set("")
+            row["ref"].set("")
+            row["designation"].set("")
+            row["pu"].set("")
+            row["remise"].set("")
+            row["piece_id"] = None
+            return
+        self._close_popup(row)
+        row["frame"].destroy()
+        self._rows.remove(row)
+        if self.on_change:
+            try: self.on_change()
+            except Exception: pass
+
+    def load(self, lignes):
+        for r in self._rows:
+            self._close_popup(r)
+            r["frame"].destroy()
+        self._rows.clear()
+        if not lignes:
+            for _ in range(2):
+                self.add_row()
+        else:
+            for l in lignes:
+                self.add_row(qte=str(l.get("quantite", "") or ""),
+                             ref=str(l.get("reference", "") or ""),
+                             designation=str(l.get("libelle", "") or ""),
+                             pu=str(l.get("prix_unitaire", "") or ""),
+                             remise=str(l.get("remise_pct", "") or ""),
+                             piece_id=l.get("piece_id"))
+
+    def to_list(self):
+        out = []
+        for i, r in enumerate(self._rows):
+            qte = r["qte"].get().strip()
+            ref = r["ref"].get().strip()
+            desg = r["designation"].get().strip()
+            pu = r["pu"].get().strip()
+            remise = r["remise"].get().strip()
+            if not (qte or ref or desg or pu):
+                continue
+            out.append({
+                "piece_id": r.get("piece_id"),
+                "reference": ref,
+                "libelle": desg,
+                "quantite": _to_float_devis(qte, 1.0),
+                "prix_unitaire": _to_float_devis(pu, 0.0),
+                "remise_pct": _to_float_devis(remise, 0.0),
+                "ordre": i,
+            })
+        return out
+
+    def set_state(self, state):
+        """state = 'normal' ou 'disabled' : verrouille toutes les lignes existantes."""
+        for w in (self.bf,):
+            for child in w.winfo_children():
+                try: child.configure(state=state)
+                except tk.TclError: pass
+        for r in self._rows:
+            r["ref_entry"].configure(state=state)
+            r["ref_btn"].configure(state=state)
+            # Les champs de saisie sont imbriqués dans des cellules de largeur
+            # fixe (cf. add_row) et ne sont donc plus des enfants directs de
+            # "frame" : on parcourt tout le sous-arbre pour les retrouver.
+            stack = list(r["frame"].winfo_children())
+            while stack:
+                child = stack.pop()
+                if isinstance(child, (ttk.Entry, tk.Button)):
+                    try: child.configure(state=state)
+                    except tk.TclError: pass
+                stack.extend(child.winfo_children())
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # WIDGET TEMPS & FRAIS (anciennement DEPLACEMENTS)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4854,8 +5606,12 @@ class MoteurFicheDialog(tk.Toplevel):
             ("Type moteur", moteur.get("type_moteur", "")),
             ("Client", moteur.get("client_nom", "")),
             ("Navire / Site", moteur.get("navire", "")),
+            ("Immatriculation navire", moteur.get("navire_immatriculation", "")),
+            ("Port d'attache", moteur.get("navire_port_attache", "")),
             ("Machine", moteur.get("machine", "")),
             ("Réf. constructeur", moteur.get("ref_constructeur", "")),
+            ("Puissance/RPM", moteur.get("puissance_rpm", "")),
+            ("Puissance PME/RPM", moteur.get("puissance_pme_rpm", "")),
             ("Code affaire", moteur.get("code_affaire", "")),
             ("Mise en service", moteur.get("date_mise_service", "")),
             ("Durée garantie", f"{moteur.get('duree_garantie', '')} mois"
@@ -4951,7 +5707,10 @@ class MoteurFicheDialog(tk.Toplevel):
         self._se_cache = []
         af_se = tk.Frame(tab_se, bg=C["bg"]); af_se.pack(fill="x", padx=8, pady=(0, 6))
         mk_btn(af_se, "➕ Ajouter", self._se_add).pack(side="left", padx=4)
+        mk_btn(af_se, "🔗 Rattacher existant", self._se_attach,
+               color=C["btn2"]).pack(side="left", padx=4)
         mk_btn(af_se, "✏️ Modifier", self._se_edit, color=C["btn2"]).pack(side="left", padx=4)
+        mk_btn(af_se, "🔓 Détacher", self._se_detach, color=C["btn2"]).pack(side="left", padx=4)
         mk_btn(af_se, "🗑️ Supprimer", self._se_del, color=C["danger"]).pack(side="left", padx=4)
         self.tree_se.bind("<Double-1>", lambda _: self._se_edit())
 
@@ -5024,6 +5783,55 @@ class MoteurFicheDialog(tk.Toplevel):
         MoteurDialog(self, self.app, parent_moteur=dict(self.moteur),
                      on_save=self._charger)
 
+    def _se_attach(self):
+        """Rattache un moteur déjà saisi (pré-entré à part) comme
+        sous-ensemble de ce moteur, sans avoir à ressaisir ses champs."""
+        mid = self.moteur.get("id")
+        try:
+            candidats = [m for m in db.get_moteurs()
+                         if m["id"] != mid and m.get("nb_sous_ensembles", 0) == 0]
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e), parent=self)
+            return
+        if not candidats:
+            messagebox.showinfo("Rattacher", "Aucun moteur disponible à rattacher.",
+                                 parent=self)
+            return
+
+        def _choisi(cible):
+            try:
+                db.update_moteur(cible["id"], {"parent_moteur_id": mid})
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e), parent=self)
+                return
+            self._charger()
+
+        ChoisirMoteurDialog(
+            self, self.app, candidats,
+            f"Rattacher un moteur existant à « {self.moteur.get('num_serie', '')} » :",
+            _choisi)
+
+    def _se_detach(self):
+        sel = self.tree_se.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un sous-ensemble.", parent=self)
+            return
+        idx = int(sel[0].replace("se_", ""))
+        if idx >= len(self._se_cache):
+            return
+        se = self._se_cache[idx]
+        if not messagebox.askyesno(
+                "Détacher",
+                f"Détacher « {se.get('num_serie', '')} » de ce moteur ?\n\n"
+                "Il redeviendra un moteur indépendant dans la liste principale.",
+                parent=self):
+            return
+        try:
+            db.update_moteur(se["id"], {"parent_moteur_id": None})
+            self._charger()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e), parent=self)
+
     def _se_edit(self):
         sel = self.tree_se.selection()
         if not sel:
@@ -5048,11 +5856,17 @@ class MoteurFicheDialog(tk.Toplevel):
                 f"Supprimer le sous-ensemble « {se.get('num_serie', '')} » ?\n\n"
                 "Cette action est irréversible.", parent=self):
             return
+        err = None
         try:
             db.delete_moteur(se["id"])
-            self._charger()
         except Exception as e:
-            messagebox.showerror("Erreur", str(e), parent=self)
+            err = e
+        self._charger()
+        # Une erreur réseau (timeout…) ne veut pas forcément dire que la
+        # suppression a échoué côté serveur : on vérifie l'état réel après
+        # rechargement avant d'alarmer.
+        if err is not None and any(s["id"] == se["id"] for s in self._se_cache):
+            messagebox.showerror("Erreur", str(err), parent=self)
 
     def _ouvrir_dossier_inv(self):
         sel = self.tree_inv.selection()
@@ -5101,21 +5915,68 @@ class MoteurFicheDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CHOIX D'UN MOTEUR (rattachement a posteriori comme sous-ensemble)
+# ══════════════════════════════════════════════════════════════════════════════
+class ChoisirMoteurDialog(tk.Toplevel):
+    """Sélecteur générique d'un moteur dans une liste filtrable.
+
+    Utilisé pour rattacher un moteur déjà saisi comme sous-ensemble d'un
+    autre après coup (pré-saisie puis affectation en temps voulu), dans les
+    deux sens : choisir le futur moteur principal, ou choisir un moteur
+    existant à rattacher à un moteur principal donné."""
+    def __init__(self, parent, app, moteurs, titre, on_choose):
+        super().__init__(parent)
+        self.app = app
+        self.on_choose = on_choose
+        self.title(titre)
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.grab_set()
+        self._moteurs = moteurs
+        self._by_label = {self._label(m): m for m in moteurs}
+        tk.Label(self, text=titre, bg=C["bg"], font=("Arial", 10, "bold"),
+                 wraplength=420, justify="left").pack(padx=20, pady=(16, 8), anchor="w")
+        self.var = tk.StringVar()
+        self._combo = SearchableCombobox(
+            self, textvariable=self.var,
+            values=list(self._by_label.keys()), width=50)
+        self._combo.pack(padx=20, pady=(0, 8))
+        bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=14)
+        mk_btn(bf, "✅ Valider", self._valider).pack(side="left", padx=8)
+        mk_btn(bf, "Annuler", self.destroy, color="#888").pack(side="left", padx=8)
+
+    @staticmethod
+    def _label(m):
+        return (f"{m.get('num_serie', '')} — {m.get('marque', '') or '—'} "
+                f"({m.get('client_nom', '') or '—'})")
+
+    def _valider(self):
+        m = self._by_label.get(self.var.get())
+        if not m:
+            messagebox.showwarning("Sélection", "Sélectionnez un moteur dans la liste.",
+                                    parent=self)
+            return
+        self.on_choose(m)
+        self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DIALOG MOTEUR
 # ══════════════════════════════════════════════════════════════════════════════
 class MoteurDialog(tk.Toplevel):
     FIELDS = [
         ("num_serie",                  "N° Série *"),
         ("navire",                     "Navire / Site"),
+        ("navire_immatriculation",     "Immatriculation navire"),
+        ("navire_port_attache",        "Port d'attache"),
         ("machine",                    "Machine"),
-        ("type_moteur",                "Type moteur / inverseur"),
         ("marque",                     "Marque"),
+        ("type_moteur",                "Type moteur / inverseur"),
         ("ref_constructeur",           "Réf. Constructeur"),
-        ("cylindree",                  "Cylindrée"),
-        ("famille",                    "Famille"),
         ("application",                "Application"),
         ("typologie",                  "Typologie"),
-        ("collection",                 "Collection"),
+        ("puissance_rpm",              "Puissance/RPM"),
+        ("puissance_pme_rpm",          "Puissance PME/RPM"),
         ("code_affaire",               "Code Affaire"),
         ("date_mise_service",          "Mise en service"),
         ("duree_garantie",             "Garantie (mois)"),
@@ -5128,9 +5989,10 @@ class MoteurDialog(tk.Toplevel):
     # Champs hérités du moteur principal à la création d'un sous-ensemble :
     # uniquement le contexte d'installation / client final. Un sous-ensemble
     # est un équipement à part entière (ex : l'inverseur d'un moteur), donc
-    # sa marque/type/référence/cylindrée etc. ne sont PAS préremplis.
+    # sa marque/type/référence etc. ne sont PAS préremplis.
     INHERITED_FIELDS = {
-        "navire", "machine", "code_affaire", "type_client",
+        "navire", "navire_immatriculation", "navire_port_attache",
+        "machine", "code_affaire", "type_client",
         "date_mise_service", "duree_garantie",
         "client_utilisateur_nom", "client_utilisateur_email",
         "client_utilisateur_tel", "client_utilisateur_adresse",
@@ -5155,6 +6017,7 @@ class MoteurDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.grab_set()
         self._clients = list(db.get_clients())
+        self._navires = db.get_navires()
         self._types_moteur = db.get_types_moteur()
         self._type_to_marque = {t["libelle"]: t["marque"] for t in self._types_moteur}
         self.client_var = tk.StringVar()
@@ -5199,20 +6062,16 @@ class MoteurDialog(tk.Toplevel):
                 EmailEntry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
             elif key == "client_utilisateur_adresse":
                 ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
-            elif key == "type_moteur":
-                row_t = tk.Frame(f, bg=C["bg"])
-                row_t.grid(row=i, column=1, pady=4, sticky="w")
-                self._type_moteur_combo = SearchableCombobox(
-                    row_t, textvariable=self.v["type_moteur"],
-                    values=[t["libelle"] for t in self._types_moteur],
-                    width=30, min_chars_to_open=1, allow_free_text=True)
-                self._type_moteur_combo.pack(side="left")
-                self._type_moteur_combo.bind("<<ComboboxSelected>>",
-                                              self._on_type_moteur_selected)
-                def _open_types_moteur():
-                    TypesMoteurDialog(self, self.app,
-                        on_close=self._reload_types_moteur)
-                mk_btn(row_t, "⚙", _open_types_moteur, color=C["btn2"]).pack(side="left", padx=(8,0))
+            elif key == "navire":
+                row_n = tk.Frame(f, bg=C["bg"])
+                row_n.grid(row=i, column=1, pady=4, sticky="w")
+                self._navire_combo = SearchableCombobox(
+                    row_n, textvariable=self.v["navire"],
+                    values=sorted({n["nom"] for n in self._navires if n.get("nom")}),
+                    width=34, allow_free_text=True)
+                self._navire_combo.pack(side="left")
+                self._navire_combo.bind("<<ComboboxSelected>>", self._on_navire_field_changed)
+                self._navire_combo.entry.bind("<FocusOut>", self._on_navire_field_changed, add="+")
             elif key == "marque":
                 row_m = tk.Frame(f, bg=C["bg"])
                 row_m.grid(row=i, column=1, pady=4, sticky="w")
@@ -5222,10 +6081,34 @@ class MoteurDialog(tk.Toplevel):
                 self._marque_combo.pack(side="left")
                 self._marque_combo.bind("<<ComboboxSelected>>",
                                          self._on_marque_selected)
+                # Trace sur la variable plutôt que le seul événement de sélection :
+                # couvre aussi la saisie libre au clavier, le collage, et le
+                # préremplissage programmatique (ex. depuis _on_type_moteur_selected),
+                # qui ne déclenchent pas <<ComboboxSelected>>. Sans ça, la liste des
+                # types moteur pouvait rester filtrée sur une ancienne marque.
+                self.v["marque"].trace_add("write", self._on_marque_selected)
                 def _open_marques():
                     MarquesDialog(self, self.app,
                         on_close=lambda: self._marque_combo.set_values(db.get_marques()))
                 mk_btn(row_m, "⚙", _open_marques, color=C["btn2"]).pack(side="left", padx=(8,0))
+            elif key == "type_moteur":
+                row_t = tk.Frame(f, bg=C["bg"])
+                row_t.grid(row=i, column=1, pady=4, sticky="w")
+                marque_actuelle = self.v["marque"].get().strip()
+                types_filtres = [t["libelle"] for t in self._types_moteur
+                                 if not marque_actuelle or t.get("marque") == marque_actuelle]
+                self._type_moteur_combo = SearchableCombobox(
+                    row_t, textvariable=self.v["type_moteur"],
+                    values=types_filtres or [t["libelle"] for t in self._types_moteur],
+                    width=30, allow_free_text=True)
+                self._type_moteur_combo.pack(side="left")
+                self._type_moteur_combo.bind("<<ComboboxSelected>>",
+                                              self._on_type_moteur_selected)
+                def _open_types_moteur():
+                    TypesMoteurDialog(self, self.app,
+                        on_close=self._reload_types_moteur,
+                        default_marque=self.v["marque"].get().strip() or None)
+                mk_btn(row_t, "⚙", _open_types_moteur, color=C["btn2"]).pack(side="left", padx=(8,0))
             else:
                 ttk.Entry(f, textvariable=self.v[key], width=34).grid(row=i, column=1, pady=4)
         bf = tk.Frame(self, bg=C["bg"])
@@ -5252,6 +6135,21 @@ class MoteurDialog(tk.Toplevel):
         db.upsert_moteur(data, moteur_id=self.moteur["id"] if self.moteur else None)
         if self.on_save: self.on_save()
         self.destroy()
+
+    def _on_navire_field_changed(self, *_):
+        """Précomplète immatriculation / port d'attache depuis le registre
+        Navire quand le nom saisi correspond à un navire déjà connu."""
+        nom = self.v["navire"].get().strip()
+        if not nom:
+            return
+        nav = next((n for n in self._navires
+                    if (n.get("nom") or "").strip().lower() == nom.lower()), None)
+        if not nav:
+            return
+        if not self.v["navire_immatriculation"].get().strip() and nav.get("immatriculation"):
+            self.v["navire_immatriculation"].set(nav["immatriculation"])
+        if not self.v["navire_port_attache"].get().strip() and nav.get("port_attache"):
+            self.v["navire_port_attache"].set(nav["port_attache"])
 
     def _on_type_moteur_selected(self, *_):
         libelle = self.v["type_moteur"].get()
@@ -5322,6 +6220,110 @@ class TechnicienDialog(tk.Toplevel):
                 # Callback sans argument (compatibilité)
                 self.on_save()
         self.destroy()
+
+
+class ContactDialog(tk.Toplevel):
+    def __init__(self, parent, app, contact=None, on_save=None):
+        super().__init__(parent)
+        self.app = app; self.contact = contact; self.on_save = on_save
+        self.title("Nouveau contact" if not contact else f"Modifier – {contact['nom']}")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.grab_set()
+        self.v = {k: tk.StringVar(value=contact.get(k,"") if contact else "")
+                  for k in ["nom","email","telephone","entreprise"]}
+        f = tk.Frame(self, bg=C["bg"]); f.pack(padx=24, pady=18)
+        for i,(key,lbl) in enumerate([("nom","Nom *"),("email","Email"),("telephone","Téléphone"),
+                                       ("entreprise","Client")]):
+            tk.Label(f, text=lbl, bg=C["bg"], font=("Arial",10),
+                     anchor="e", width=14).grid(row=i, column=0, sticky="e", padx=(0,6), pady=4)
+            if key == "email":
+                EmailEntry(f, textvariable=self.v[key], width=36).grid(row=i, column=1, pady=4)
+            else:
+                ttk.Entry(f, textvariable=self.v[key], width=36).grid(row=i, column=1, pady=4)
+        bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=12)
+        mk_btn(bf,"💾 Enregistrer",self._save).pack(side="left",padx=8)
+        mk_btn(bf,"Annuler",self.destroy,color="#888").pack(side="left",padx=8)
+
+    def _save(self):
+        nom = self.v["nom"].get().strip()
+        if not nom: messagebox.showwarning("Champ requis","Le nom est obligatoire."); return
+        email = self.v["email"].get().strip()
+        if email and not db.email_looks_valid(email):
+            if not messagebox.askyesno("Format email douteux",
+                    f"L'email '{email}' semble mal formé.\n\n"
+                    "Voulez-vous quand même l'enregistrer ?"):
+                return
+        db.upsert_contact({k:self.v[k].get().strip() for k in self.v},
+                          contact_id=self.contact["id"] if self.contact else None)
+        if self.on_save:
+            try:
+                self.on_save(nom)
+            except TypeError:
+                self.on_save()
+        self.destroy()
+
+
+class DoublonContactDialog(tk.Toplevel):
+    """Demande à l'utilisateur quel contact conserver parmi un groupe de doublons
+    (même email et/ou même téléphone). Les autres contacts du groupe sont supprimés."""
+    def __init__(self, parent, app, group, on_done=None):
+        super().__init__(parent)
+        self.app = app
+        self.group = group
+        self.on_done = on_done
+        self.title("Doublon de contact détecté")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.grab_set()
+
+        tk.Label(self, text="Doublon détecté", bg=C["bg"],
+                 font=F["h2"], fg=C["header"]).pack(pady=(14, 2))
+        tk.Label(self, text="Ces contacts partagent le même email et/ou le même téléphone.\n"
+                             "Sélectionnez celui à conserver — les autres seront supprimés.",
+                 bg=C["bg"], font=F["small"], fg=C["text_muted"],
+                 justify="center").pack(pady=(0, 10))
+
+        # Par défaut : on propose de conserver le contact le plus utilisé.
+        default_id = max(group, key=lambda c: c.get("usage_count", 0) or 0)["id"]
+        self.choice_var = tk.StringVar(value=default_id)
+
+        lf = tk.Frame(self, bg=C["bg"])
+        lf.pack(fill="both", expand=True, padx=20, pady=4)
+        for c in group:
+            rf = tk.Frame(lf, bg=C["bg"])
+            rf.pack(fill="x", pady=3, anchor="w")
+            tk.Radiobutton(
+                rf, variable=self.choice_var, value=c["id"],
+                bg=C["bg"], activebackground=C["bg"],
+                text=f"{c['nom']}  —  {c.get('email') or '—'}  —  {c.get('telephone') or '—'}"
+                     f"  —  {c.get('entreprise') or '—'}  (utilisé {c.get('usage_count', 0)}×)",
+                font=("Arial", 10), anchor="w", justify="left",
+                wraplength=520,
+            ).pack(side="left", fill="x")
+
+        bf = tk.Frame(self, bg=C["bg"])
+        bf.pack(pady=14)
+        mk_btn(bf, "✅ Conserver la sélection", self._resoudre).pack(side="left", padx=6)
+        mk_btn(bf, "⏭️ Ignorer ce doublon", self._ignorer, color=C["btn3"]).pack(side="left", padx=6)
+
+    def _termine(self):
+        self.destroy()
+        if self.on_done:
+            self.on_done()
+
+    def _ignorer(self):
+        self._termine()
+
+    def _resoudre(self):
+        keep_id = self.choice_var.get()
+        others = [c for c in self.group if c["id"] != keep_id]
+        for c in others:
+            try:
+                db.delete_contact(c["id"])
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible de supprimer '{c['nom']}' :\n{e}")
+        self._termine()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5405,7 +6407,9 @@ class MarquesDialog(tk.Toplevel):
 
 
 class TypesMoteurDialog(tk.Toplevel):
-    def __init__(self, parent, app, on_close=None):
+    ALL_MARQUES = "(Toutes les marques)"
+
+    def __init__(self, parent, app, on_close=None, default_marque=None):
         super().__init__(parent)
         self.app = app
         self.on_close = on_close
@@ -5413,11 +6417,25 @@ class TypesMoteurDialog(tk.Toplevel):
         self.title("Types de moteur")
         self.resizable(False, False)
         self.configure(bg=C["bg"])
-        self.geometry("420x500")
+        self.geometry("420x520")
         self.grab_set()
 
         tk.Label(self, text="Types de moteur", bg=C["bg"],
                  font=("Arial",11,"bold"), fg=C["header"]).pack(pady=(14,4))
+
+        # Filtre par marque : affiche uniquement les types de la marque
+        # choisie (par défaut, celle déjà sélectionnée dans le formulaire
+        # moteur d'où ce dialogue a été ouvert, s'il y en a une).
+        flt = tk.Frame(self, bg=C["bg"]); flt.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Label(flt, text="Marque :", bg=C["bg"], font=("Arial",10)).pack(side="left")
+        marques = db.get_marques()
+        self.filter_var = tk.StringVar(
+            value=default_marque if default_marque in marques else self.ALL_MARQUES)
+        self._filter_cb = ttk.Combobox(flt, textvariable=self.filter_var,
+                                        values=[self.ALL_MARQUES] + marques,
+                                        state="readonly", width=26)
+        self._filter_cb.pack(side="left", padx=(6, 0))
+        self._filter_cb.bind("<<ComboboxSelected>>", self._on_filter_changed)
 
         lf = tk.Frame(self, bg=C["bg"]); lf.pack(fill="both", expand=True, padx=16, pady=4)
         self.lst = tk.Listbox(lf, font=("Arial",10), height=9,
@@ -5432,10 +6450,10 @@ class TypesMoteurDialog(tk.Toplevel):
         ttk.Entry(ff, textvariable=self.input_libelle, width=26).grid(row=0, column=1, sticky="w")
         tk.Label(ff, text="Marque associée :", bg=C["bg"], width=17, anchor="e",
                  font=("Arial",10)).grid(row=1, column=0, padx=(0,6), pady=4)
-        self.input_marque = tk.StringVar()
-        self._marque_cb = SearchableCombobox(ff, textvariable=self.input_marque,
-                                              values=db.get_marques(), width=24,
-                                              allow_free_text=True)
+        self.input_marque = tk.StringVar(
+            value=default_marque if default_marque in marques else "")
+        self._marque_cb = ttk.Combobox(ff, textvariable=self.input_marque,
+                                        values=marques, width=23)
         self._marque_cb.grid(row=1, column=1, sticky="w")
 
         bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=10)
@@ -5445,12 +6463,23 @@ class TypesMoteurDialog(tk.Toplevel):
         mk_btn(bf, "Fermer", self._close, color="#888").pack(side="left", padx=4)
         self._refresh()
 
+    def _on_filter_changed(self, *_):
+        # Pré-remplit la marque du formulaire d'ajout avec le filtre actif,
+        # pratique pour enchaîner l'ajout de plusieurs types d'une marque.
+        marque = self.filter_var.get()
+        self.input_marque.set("" if marque == self.ALL_MARQUES else marque)
+        self._refresh()
+
     def _refresh(self):
-        self._items = db.get_types_moteur()
+        marque = self.filter_var.get()
+        show_all = marque == self.ALL_MARQUES
+        all_items = db.get_types_moteur()
+        self._items = all_items if show_all else \
+            [t for t in all_items if (t.get("marque") or "") == marque]
         self.lst.delete(0, "end")
         for t in self._items:
             label = t["libelle"]
-            if t.get("marque"):
+            if show_all and t.get("marque"):
                 label += f"  ← {t['marque']}"
             self.lst.insert("end", label)
 
@@ -5474,7 +6503,6 @@ class TypesMoteurDialog(tk.Toplevel):
             messagebox.showwarning("Doublon", f"Le type '{lib}' existe déjà.")
             return
         self.input_libelle.set("")
-        self.input_marque.set("")
         self._refresh()
 
     def _selected_item(self):
@@ -5503,7 +6531,7 @@ class TypesMoteurDialog(tk.Toplevel):
                 "(Les moteurs existants conservent leur libellé.)"):
             db.delete_type_moteur(item["libelle"])
             self.input_libelle.set("")
-            self.input_marque.set("")
+            self._refresh()
             self._refresh()
 
 
@@ -5963,6 +6991,28 @@ class BonDialog(tk.Toplevel):
                     "TButton", "Button"):
             self.bind_class(cls, "<MouseWheel>", _on_wheel, add="+")
 
+        def _combo_scroll_to_canvas(combo):
+            """Empeche le ttk.Combobox readonly de changer sa valeur au survol
+            de la molette (comportement natif Tk sur <MouseWheel>, meme sans
+            ouvrir la liste) : on relaie le scroll au canvas et on "break"
+            pour bloquer le binding de classe TCombobox qui suit."""
+            def _redirect(ev):
+                _on_wheel(ev)
+                return "break"
+            combo.bind("<MouseWheel>", _redirect)
+
+        # Bandeau lien devis d'origine (rempli/affiché par _refresh_devis_lien
+        # si ce bon a été créé par transformation d'un devis). Packé en premier
+        # comme dans DevisDialog, gardé vide par défaut.
+        self._devis_id_lie = None
+        self._bandeau = tk.Frame(p, bg=C["bg"])
+        self._bandeau.pack(fill="x")
+        self._bandeau_lbl = tk.Label(self._bandeau, text="", font=("Arial", 9, "bold"),
+                                      bg=C["bg"], fg="#1d4ed8", anchor="w",
+                                      cursor="hand2")
+        self._bandeau_lbl.pack(side="left", padx=12, pady=0)
+        self._bandeau_lbl.bind("<Button-1>", lambda _e: self._voir_devis_lie())
+
         # ── CLIENT ────────────────────────────────────────────────────────────
         section_bar(p, "CLIENT")
         row = tk.Frame(p, bg=C["bg"])
@@ -6109,6 +7159,7 @@ class BonDialog(tk.Toplevel):
         self._garantie_lien_combo.pack(side="left")
         self._garantie_lien_combo.bind("<<ComboboxSelected>>",
                                        self._on_garantie_lien_selected)
+        _combo_scroll_to_canvas(self._garantie_lien_combo)
 
         # ── MOTEURS SUPPLÉMENTAIRES ───────────────────────────────────────────
         self._extra_moteurs_rows = []
@@ -6143,6 +7194,7 @@ class BonDialog(tk.Toplevel):
                                         values=_types,
                                         width=44, state="readonly")
         self._type_combo.pack(side="left")
+        _combo_scroll_to_canvas(self._type_combo)
         if not self.is_offline:
             mk_btn(r, "⚙", lambda: TypesDialog(self, self.app,
                    on_close=lambda: self._type_combo.config(
@@ -6158,6 +7210,7 @@ class BonDialog(tk.Toplevel):
         urg_combo = ttk.Combobox(r, textvariable=self.urgence_var, values=URGENCES,
                                   width=44, state="readonly")
         urg_combo.pack(side="left")
+        _combo_scroll_to_canvas(urg_combo)
         # Couleur du label selon urgence
         self.urg_indicator = tk.Label(r, text="", bg=C["bg"], font=("Arial", 14, "bold"))
         self.urg_indicator.pack(side="left", padx=(8, 0))
@@ -6206,14 +7259,14 @@ class BonDialog(tk.Toplevel):
         r = tk.Frame(p, bg=C["bg"]); r.pack(fill="x", padx=20, pady=4)
         tk.Label(r, text="Statut", bg=C["bg"], font=("Arial",10),
                  width=24, anchor="e").pack(side="left", padx=(0,8))
-        ttk.Combobox(r, textvariable=self.statut_var, values=STATUTS,
-                     width=44, state="readonly").pack(side="left")
+        statut_combo = ttk.Combobox(r, textvariable=self.statut_var, values=STATUTS,
+                                     width=44, state="readonly")
+        statut_combo.pack(side="left")
+        _combo_scroll_to_canvas(statut_combo)
 
         # ── DEMANDE DU CLIENT ─────────────────────────────────────────────────
         section_bar(p, "DEMANDE DU CLIENT *")
-        self.txt_demande = tk.Text(p, height=4, font=("Arial",10), wrap="word",
-                                    relief="solid", bd=1, padx=6, pady=4)
-        self.txt_demande.pack(fill="x", padx=20, pady=(4,4))
+        self.txt_demande = scrolled_text(p, height=4)
 
         # ── OPTIONS ───────────────────────────────────────────────────────────
         op = tk.Frame(p, bg=C["bg"])
@@ -6238,15 +7291,11 @@ class BonDialog(tk.Toplevel):
 
         # ── CONSTAT ───────────────────────────────────────────────────────────
         section_bar(p, "CONSTAT AVANT INTERVENTION")
-        self.txt_constat = tk.Text(p, height=5, font=("Arial",10), wrap="word",
-                                    relief="solid", bd=1, padx=6, pady=4)
-        self.txt_constat.pack(fill="x", padx=20, pady=(4,4))
+        self.txt_constat = scrolled_text(p, height=5)
 
         # ── TRAVAUX ───────────────────────────────────────────────────────────
         section_bar(p, "TRAVAUX RÉALISÉS")
-        self.txt_travaux = tk.Text(p, height=5, font=("Arial",10), wrap="word",
-                                    relief="solid", bd=1, padx=6, pady=4)
-        self.txt_travaux.pack(fill="x", padx=20, pady=(4,4))
+        self.txt_travaux = scrolled_text(p, height=10)
 
         # ── MATÉRIELS ─────────────────────────────────────────────────────────
         section_bar(p, "MATÉRIELS UTILISÉS (Quantité / Référence / Désignation)")
@@ -6260,9 +7309,7 @@ class BonDialog(tk.Toplevel):
                        variable=self.chk["pour_information"],
                        bg=C["bg"], font=("Arial", 10, "bold")
                        ).pack(side="left")
-        self.txt_info = tk.Text(p, height=3, font=("Arial", 10), wrap="word",
-                                 relief="solid", bd=1, padx=6, pady=4)
-        self.txt_info.pack(fill="x", padx=20, pady=(2, 6))
+        self.txt_info = scrolled_text(p, height=3, pady=(2, 6))
 
         # ── PRÉCONISATION (encart dédié) ──────────────────────────────────
         preco_f = tk.Frame(p, bg=C["bg"])
@@ -6271,9 +7318,7 @@ class BonDialog(tk.Toplevel):
                        variable=self.chk["preconisation"],
                        bg=C["bg"], font=("Arial", 10, "bold")
                        ).pack(side="left")
-        self.txt_preco = tk.Text(p, height=3, font=("Arial", 10), wrap="word",
-                                  relief="solid", bd=1, padx=6, pady=4)
-        self.txt_preco.pack(fill="x", padx=20, pady=(2, 6))
+        self.txt_preco = scrolled_text(p, height=3, pady=(2, 6))
 
         # ── DÉPLACEMENTS ──────────────────────────────────────────────────────
         section_bar(p, "DÉPLACEMENTS – Temps & frais")
@@ -6337,9 +7382,7 @@ class BonDialog(tk.Toplevel):
 
         # ── COMMENTAIRE ───────────────────────────────────────────────────────
         section_bar(p, "COMMENTAIRE")
-        self.txt_commentaire = tk.Text(p, height=4, font=("Arial",10), wrap="word",
-                                        relief="solid", bd=1, padx=6, pady=4)
-        self.txt_commentaire.pack(fill="x", padx=20, pady=(4, 8))
+        self.txt_commentaire = scrolled_text(p, height=4, pady=(4, 8))
 
         # ── BOUTONS ───────────────────────────────────────────────────────────
         bf = tk.Frame(p, bg=C["bg"])
@@ -7038,6 +8081,25 @@ class BonDialog(tk.Toplevel):
                                  initial_nb_heures=em.get("nb_heures_fct", ""))
 
         self._refresh_files()
+        self._devis_id_lie = row_get(inv, "devis_id") or None
+        self._refresh_devis_lien(row_get(inv, "num_devis"))
+
+    def _refresh_devis_lien(self, num_devis):
+        """Affiche un bandeau cliquable vers le devis d'origine si ce bon a
+        été créé par transformation d'un devis (cf. DevisDialog._refresh_lock_state)."""
+        if num_devis and self._devis_id_lie:
+            self._bandeau.configure(bg="#dbeafe")
+            self._bandeau_lbl.configure(
+                bg="#dbeafe", pady=6,
+                text=f"ℹ️ Ce bon a été créé à partir du devis {num_devis} — cliquer pour l'ouvrir.")
+        else:
+            self._bandeau.configure(bg=C["bg"])
+            self._bandeau_lbl.configure(bg=C["bg"], pady=0, text="")
+
+    def _voir_devis_lie(self):
+        if not self._devis_id_lie:
+            return
+        DevisDialog(self, self.app, devis_id=self._devis_id_lie)
 
     def _exporter_central(self):
         """Exporte le bon selectionne vers la base centrale (serveur atelier)."""
@@ -7193,8 +8255,9 @@ class BonDialog(tk.Toplevel):
             "moteurs_supplementaires_json": json.dumps(
                 [
                     {
-                        **{k: row_get(m, k) for k in ("id","num_serie","navire","machine",
-                                                       "type_moteur","marque","ref_constructeur",
+                        **{k: row_get(m, k) for k in ("id","num_serie","navire",
+                                                       "navire_immatriculation","navire_port_attache",
+                                                       "machine","type_moteur","marque","ref_constructeur",
                                                        "date_mise_service","duree_garantie")},
                         "nb_heures_fct": e.get("nb_heures_var", tk.StringVar()).get().strip(),
                     }
@@ -7280,6 +8343,853 @@ class BonDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DEVIS — formulaire de création / modification
+# ══════════════════════════════════════════════════════════════════════════════
+class DevisDialog(tk.Toplevel):
+    """Formulaire création / modification d'un devis chiffré. Ne réutilise pas
+    BonDialog (trop de champs non pertinents pour un devis) mais reprend son
+    pattern de sélection client/moteur et son canvas scrollable."""
+
+    def __init__(self, parent, app, devis_id=None, on_save=None):
+        super().__init__(parent)
+        self.app = app
+        self.devis_id = devis_id
+        self.on_save = on_save
+        self.is_edit = devis_id is not None
+        self._devis = None  # rempli par _load() en mode édition
+
+        self.title("Modifier le devis" if self.is_edit else "Nouveau devis")
+        self.geometry("900x760")
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+        self.configure(bg=C["bg"])
+        self.grab_set()
+
+        self._clients = list(db.get_clients())
+        self._all_moteurs = list(db.get_moteurs())
+        self._navires = db.get_navires()
+        self._client_by_nom = {c["nom"]: c for c in self._clients}
+        self._moteur_by_ns = {m["num_serie"]: m for m in self._all_moteurs}
+
+        self._build()
+
+        if self.is_edit:
+            self.after(50, self._load)
+        else:
+            from datetime import timedelta as _timedelta
+            defaut_validite = (datetime.now() + _timedelta(days=30)).strftime("%d/%m/%Y")
+            self.date_devis_var.set(datetime.now().strftime("%d/%m/%Y"))
+            self.date_validite_var.set(defaut_validite)
+
+    def _build(self):
+        canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(fill="both", expand=True)
+        p = tk.Frame(canvas, bg=C["bg"])
+        win_id = canvas.create_window((0, 0), window=p, anchor="nw")
+        p.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        def _on_wheel(ev):
+            try: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except tk.TclError: pass
+        self.bind("<MouseWheel>", _on_wheel)
+        for cls in ("TFrame", "Frame", "TLabel", "Label",
+                    "TCheckbutton", "Checkbutton", "TButton", "Button"):
+            self.bind_class(cls, "<MouseWheel>", _on_wheel, add="+")
+
+        # Bandeau lecture seule (rempli/affiché par _refresh_lock_state si le
+        # devis a déjà été transformé). Packé en premier (donc en haut) et
+        # gardé vide/transparent par défaut plutôt que pack/pack_forget, pour
+        # ne pas perturber l'ordre d'empilement des sections suivantes.
+        self._bandeau = tk.Frame(p, bg=C["bg"])
+        self._bandeau.pack(fill="x")
+        self._bandeau_lbl = tk.Label(self._bandeau, text="", font=("Arial", 9, "bold"),
+                                      bg=C["bg"], fg="#1d4ed8", anchor="w")
+        self._bandeau_lbl.pack(padx=12, pady=0, fill="x")
+
+        # ── CLIENT / ÉQUIPEMENT ──────────────────────────────────────────────
+        section_bar(p, "CLIENT")
+        row = tk.Frame(p, bg=C["bg"])
+        row.pack(fill="x", padx=20, pady=8)
+        tk.Label(row, text="Client *", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.client_var = tk.StringVar()
+        self.client_combo = SearchableCombobox(row, textvariable=self.client_var,
+            values=[c["nom"] for c in self._clients], width=44)
+        self.client_combo.pack(side="left")
+        self.client_combo.bind("<<ComboboxSelected>>", self._on_client_selected)
+        mk_btn(row, "+", lambda: ClientDialog(self, self.app, on_save=self._reload_refs),
+               color=C["btn2"]).pack(side="left", padx=(8, 0))
+
+        row2 = tk.Frame(p, bg=C["bg"])
+        row2.pack(fill="x", padx=20, pady=2)
+        tk.Label(row2, text="Moteur / N° Série", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.moteur_var = tk.StringVar()
+        self.moteur_combo = SearchableCombobox(row2, textvariable=self.moteur_var,
+            values=[m["num_serie"] for m in self._all_moteurs], width=44)
+        self.moteur_combo.pack(side="left")
+        self.moteur_combo.bind("<<ComboboxSelected>>", self._on_moteur_selected)
+        mk_btn(row2, "+", lambda: MoteurDialog(self, self.app, on_save=self._reload_refs),
+               color=C["btn2"]).pack(side="left", padx=(8, 0))
+
+        # ── MOTEURS SUPPLÉMENTAIRES ───────────────────────────────────────────
+        self._extra_moteurs_rows = []
+        self._extra_moteurs_container = tk.Frame(p, bg=C["bg"])
+        # Container démarré caché — affiché/masqué dynamiquement
+
+        self._add_moteur_lnk = tk.Label(p, text="＋ ajouter un moteur", bg=C["bg"],
+                                         fg="#6b7785", font=("Segoe UI", 9, "italic"),
+                                         cursor="hand2")
+        self._add_moteur_lnk.pack(anchor="w", padx=20, pady=(1, 6))
+        self._add_moteur_lnk.bind("<Button-1>", lambda _: self._add_moteur_row())
+
+        # ── DESTINATAIRE DU DEVIS ─────────────────────────────────────────────
+        # Contact à qui le devis est adressé : soit le contact du client, soit
+        # le contact "utilisateur moteur" renseigné sur l'un des moteurs
+        # concernés (principal ou supplémentaires). La liste des candidats est
+        # reconstruite à chaque changement de client/moteur (_refresh_destinataire_candidates).
+        section_bar(p, "DESTINATAIRE DU DEVIS")
+        self._destinataire_by_nom = {}
+        row_dest = tk.Frame(p, bg=C["bg"])
+        row_dest.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_dest, text="Destinataire", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.destinataire_var = tk.StringVar()
+        self.destinataire_combo = SearchableCombobox(row_dest, textvariable=self.destinataire_var,
+            values=[], width=44, allow_free_text=True)
+        self.destinataire_combo.pack(side="left")
+        self.destinataire_combo.bind("<<ComboboxSelected>>", self._on_destinataire_selected)
+        self._destinataire_origin_lbl = tk.Label(row_dest, text="", bg=C["bg"],
+                                                  font=("Arial", 9, "italic"), fg="#6b7785")
+        self._destinataire_origin_lbl.pack(side="left", padx=(10, 0))
+
+        row_dest_email = tk.Frame(p, bg=C["bg"])
+        row_dest_email.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_dest_email, text="Email destinataire", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.destinataire_email_var = tk.StringVar()
+        EmailEntry(row_dest_email, textvariable=self.destinataire_email_var, width=46).pack(side="left")
+
+        row_dest_tel = tk.Frame(p, bg=C["bg"])
+        row_dest_tel.pack(fill="x", padx=20, pady=(2, 8))
+        tk.Label(row_dest_tel, text="Téléphone destinataire", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.destinataire_tel_var = tk.StringVar()
+        ttk.Entry(row_dest_tel, textvariable=self.destinataire_tel_var, width=46).pack(side="left")
+
+        # ── NAVIRE CONCERNÉ ────────────────────────────────────────────────────
+        section_bar(p, "NAVIRE CONCERNÉ")
+        row_nav1 = tk.Frame(p, bg=C["bg"])
+        row_nav1.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_nav1, text="Nom du navire", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.navire_nom_var = tk.StringVar()
+        self._navire_combo = SearchableCombobox(
+            row_nav1, textvariable=self.navire_nom_var,
+            values=sorted({n["nom"] for n in self._navires if n.get("nom")}),
+            width=44, allow_free_text=True)
+        self._navire_combo.pack(side="left")
+        self._navire_combo.bind("<<ComboboxSelected>>", self._on_navire_field_changed)
+        self._navire_combo.entry.bind("<FocusOut>", self._on_navire_field_changed, add="+")
+
+        row_nav2 = tk.Frame(p, bg=C["bg"])
+        row_nav2.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_nav2, text="Immatriculation / n° francisation", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.navire_immat_var = tk.StringVar()
+        ttk.Entry(row_nav2, textvariable=self.navire_immat_var, width=44).pack(side="left")
+
+        row_nav3 = tk.Frame(p, bg=C["bg"])
+        row_nav3.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_nav3, text="Pavillon", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.navire_pavillon_var = tk.StringVar()
+        ttk.Entry(row_nav3, textvariable=self.navire_pavillon_var, width=20).pack(side="left")
+        tk.Label(row_nav3, text="   Port d'attache", bg=C["bg"], font=("Arial", 10),
+                 anchor="e").pack(side="left", padx=(12, 8))
+        self.navire_port_var = tk.StringVar()
+        ttk.Entry(row_nav3, textvariable=self.navire_port_var, width=20).pack(side="left")
+
+        row_nav4 = tk.Frame(p, bg=C["bg"])
+        row_nav4.pack(fill="x", padx=20, pady=2)
+        tk.Label(row_nav4, text="Type / usage", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.navire_usage_var = tk.StringVar()
+        ttk.Entry(row_nav4, textvariable=self.navire_usage_var, width=44).pack(side="left")
+
+        row_nav5 = tk.Frame(p, bg=C["bg"])
+        row_nav5.pack(fill="x", padx=20, pady=(2, 8))
+        tk.Label(row_nav5, text="Lieu d'intervention", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.lieu_intervention_var = tk.StringVar()
+        ttk.Entry(row_nav5, textvariable=self.lieu_intervention_var, width=44).pack(side="left")
+
+        # ── DEMANDE CLIENT ────────────────────────────────────────────────────
+        section_bar(p, "DEMANDE CLIENT")
+        self.txt_demande_client = scrolled_text(p, height=4, pady=(4, 8))
+
+        # ── OBJET / DESCRIPTION ──────────────────────────────────────────────
+        section_bar(p, "OBJET DU DEVIS")
+        row3 = tk.Frame(p, bg=C["bg"])
+        row3.pack(fill="x", padx=20, pady=2)
+        tk.Label(row3, text="Objet", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.objet_var = tk.StringVar()
+        ttk.Entry(row3, textvariable=self.objet_var, width=60).pack(side="left", fill="x", expand=True)
+
+        self.txt_description = scrolled_text(p, height=4, pady=(4, 8))
+
+        # ── DATES / STATUT ────────────────────────────────────────────────────
+        row4 = tk.Frame(p, bg=C["bg"])
+        row4.pack(fill="x", padx=20, pady=4)
+        tk.Label(row4, text="Date du devis", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.date_devis_var = tk.StringVar()
+        DateEntry(row4, textvariable=self.date_devis_var, width=14).pack(side="left")
+
+        row4b = tk.Frame(p, bg=C["bg"])
+        row4b.pack(fill="x", padx=20, pady=4)
+        tk.Label(row4b, text="Validité jusqu'au", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.date_validite_var = tk.StringVar()
+        DateEntry(row4b, textvariable=self.date_validite_var, width=14).pack(side="left")
+
+        row5 = tk.Frame(p, bg=C["bg"])
+        row5.pack(fill="x", padx=20, pady=4)
+        tk.Label(row5, text="Statut", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.statut_var = tk.StringVar(value="Brouillon")
+        self.statut_combo = ttk.Combobox(row5, textvariable=self.statut_var,
+                                          values=STATUTS_DEVIS, width=20, state="readonly")
+        self.statut_combo.pack(side="left")
+        self.exonere_var = tk.IntVar(value=0)
+        ttk.Checkbutton(row5, text="Exonéré de TVA", variable=self.exonere_var,
+                        command=self._recalc_totaux).pack(side="left", padx=(20, 0))
+
+        # ── LIGNES CHIFFRÉES ─────────────────────────────────────────────────
+        section_bar(p, "LIGNES (Quantité / Référence / Désignation / PU / Remise)")
+        self.lignes_tbl = DevisLignesTable(p, on_change=self._recalc_totaux)
+        self.lignes_tbl.pack(fill="x", padx=20, pady=(4, 4))
+
+        totaux_f = tk.Frame(p, bg=C["bg"])
+        totaux_f.pack(fill="x", padx=20, pady=(4, 10))
+        self.total_ht_lbl = tk.Label(totaux_f, text="Total HT : 0,00 €",
+                                      bg=C["bg"], font=("Arial", 10, "bold"))
+        self.total_ht_lbl.pack(anchor="e")
+        self.total_tva_lbl = tk.Label(totaux_f, text="TVA 20 % : 0,00 €",
+                                       bg=C["bg"], font=("Arial", 10))
+        self.total_tva_lbl.pack(anchor="e")
+        self.total_ttc_lbl = tk.Label(totaux_f, text="Total TTC : 0,00 €",
+                                       bg=C["bg"], font=("Arial", 12, "bold"), fg=C["header"])
+        self.total_ttc_lbl.pack(anchor="e")
+
+        # ── CONDITIONS / NOTES ───────────────────────────────────────────────
+        section_bar(p, "CONDITIONS")
+        row_regl = tk.Frame(p, bg=C["bg"])
+        row_regl.pack(fill="x", padx=20, pady=(8, 8))
+        tk.Label(row_regl, text="Conditions de règlement", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+        self.conditions_var = tk.StringVar()
+        self.conditions_combo = ttk.Combobox(row_regl, textvariable=self.conditions_var,
+                                              values=CONDITIONS_REGLEMENT, width=55)
+        self.conditions_combo.pack(side="left", fill="x", expand=True)
+
+        section_bar(p, "NOTES INTERNES")
+        self.txt_notes = scrolled_text(p, height=3, pady=(4, 8))
+
+        # ── BOUTONS ───────────────────────────────────────────────────────────
+        bf = tk.Frame(p, bg=C["bg"])
+        bf.pack(pady=14)
+        mk_btn(bf, "💾 Enregistrer", lambda: self._save(generer_pdf=False)).pack(side="left", padx=6)
+        mk_btn(bf, "📄 Enregistrer + PDF", lambda: self._save(generer_pdf=True)).pack(side="left", padx=6)
+        mk_btn(bf, "📧 Envoyer au signataire", self._mail_signataire_inline,
+               color=C["btn2"]).pack(side="left", padx=6)
+        self._transform_btn = mk_btn(bf, "🔁 Transformer en bon d'intervention",
+                                      self._transformer, color=C["btn2"])
+        self._transform_btn.pack(side="left", padx=6)
+        self._transform_btn.pack_forget()  # affiché seulement si statut == Accepté
+
+        self._recalc_totaux()
+        self._refresh_destinataire_candidates()
+
+    # ─── Chargement des références ──────────────────────────────────────────
+    def _reload_refs(self):
+        old_client = self.client_var.get()
+        old_moteur = self.moteur_var.get()
+        self._clients = list(db.get_clients())
+        self._all_moteurs = list(db.get_moteurs())
+        self._navires = db.get_navires()
+        self._client_by_nom = {c["nom"]: c for c in self._clients}
+        self._moteur_by_ns = {m["num_serie"]: m for m in self._all_moteurs}
+        self.client_combo.set_values([c["nom"] for c in self._clients])
+        self.moteur_combo.set_values([m["num_serie"] for m in self._all_moteurs])
+        if hasattr(self, "_navire_combo"):
+            self._navire_combo.set_values(sorted({n["nom"] for n in self._navires if n.get("nom")}))
+        self.client_var.set(old_client)
+        self.moteur_var.set(old_moteur)
+        self._refresh_destinataire_candidates()
+
+    def _moteurs_filtres(self):
+        """Retourne la liste des moteurs filtrée selon le client sélectionné."""
+        client = self._client_by_nom.get(self.client_var.get())
+        if client:
+            return [m for m in self._all_moteurs if m["client_id"] == client["id"]]
+        return self._all_moteurs
+
+    def _on_client_selected(self, *_):
+        client = self._client_by_nom.get(self.client_var.get())
+        filtres = ([m for m in self._all_moteurs if m["client_id"] == client["id"]]
+                   if client else self._all_moteurs)
+        series = [m["num_serie"] for m in filtres]
+        self.moteur_combo.set_values(series)
+        self.moteur_var.set("")
+        # Mettre à jour les combos des moteurs supplémentaires
+        for e in self._extra_moteurs_rows:
+            e["combo"].set_values(series)
+            e["var"].set("")
+        self._refresh_destinataire_candidates()
+
+    def _on_moteur_selected(self, *_):
+        """Préremplit le nom du navire à partir du moteur sélectionné (sans
+        écraser une saisie déjà faite à la main)."""
+        moteur = self._moteur_by_ns.get(self.moteur_var.get().strip())
+        if not moteur:
+            self._refresh_destinataire_candidates()
+            return
+        if not self.navire_nom_var.get().strip() and moteur.get("navire"):
+            self.navire_nom_var.set(moteur["navire"])
+        if not self.navire_immat_var.get().strip() and moteur.get("navire_immatriculation"):
+            self.navire_immat_var.set(moteur["navire_immatriculation"])
+        if not self.navire_port_var.get().strip() and moteur.get("navire_port_attache"):
+            self.navire_port_var.set(moteur["navire_port_attache"])
+        self._refresh_destinataire_candidates()
+
+    # ─── Destinataire du devis ────────────────────────────────────────────────
+    def _destinataire_candidates(self):
+        """Construit la liste des contacts éligibles comme destinataire du
+        devis : le contact du client sélectionné, et le contact "utilisateur
+        moteur" de chaque moteur concerné (principal + supplémentaires)."""
+        candidats = {}
+        client = self._client_by_nom.get(self.client_var.get().strip())
+        if client and row_get(client, "contact"):
+            candidats[row_get(client, "contact")] = {
+                "email": row_get(client, "email"),
+                "telephone": row_get(client, "telephone"),
+                "origin": f"contact du client {row_get(client, 'nom')}",
+            }
+        series = [self.moteur_var.get().strip()] + [e["var"].get().strip() for e in self._extra_moteurs_rows]
+        for ns in series:
+            if not ns:
+                continue
+            m = self._moteur_by_ns.get(ns)
+            if not m:
+                continue
+            nom_u = row_get(m, "client_utilisateur_nom")
+            if nom_u:
+                candidats[nom_u] = {
+                    "email": row_get(m, "client_utilisateur_email"),
+                    "telephone": row_get(m, "client_utilisateur_tel"),
+                    "origin": f"utilisateur du moteur {ns}",
+                }
+        return candidats
+
+    def _refresh_destinataire_candidates(self):
+        self._destinataire_by_nom = self._destinataire_candidates()
+        self.destinataire_combo.set_values(sorted(self._destinataire_by_nom.keys()))
+        cur = self.destinataire_var.get().strip()
+        c = self._destinataire_by_nom.get(cur)
+        self._destinataire_origin_lbl.config(text=f"→ {c['origin']}" if c else "")
+
+    def _on_destinataire_selected(self, *_):
+        c = self._destinataire_by_nom.get(self.destinataire_var.get().strip())
+        if c:
+            self.destinataire_email_var.set(c.get("email", ""))
+            self.destinataire_tel_var.set(c.get("telephone", ""))
+            self._destinataire_origin_lbl.config(text=f"→ {c['origin']}")
+        else:
+            self._destinataire_origin_lbl.config(text="")
+
+    def _on_navire_field_changed(self, *_):
+        """Précomplète immatriculation / port d'attache depuis le registre
+        Navire quand le nom saisi correspond à un navire déjà connu."""
+        nom = self.navire_nom_var.get().strip()
+        if not nom:
+            return
+        nav = next((n for n in self._navires
+                    if (n.get("nom") or "").strip().lower() == nom.lower()), None)
+        if not nav:
+            return
+        if not self.navire_immat_var.get().strip() and nav.get("immatriculation"):
+            self.navire_immat_var.set(nav["immatriculation"])
+        if not self.navire_port_var.get().strip() and nav.get("port_attache"):
+            self.navire_port_var.set(nav["port_attache"])
+
+    # ─── Moteurs supplémentaires ─────────────────────────────────────────────
+    def _add_moteur_row(self, initial_ns=""):
+        # Afficher le container la première fois (avant le lien)
+        if not self._extra_moteurs_rows:
+            self._extra_moteurs_container.pack(fill="x", padx=20, pady=(2, 0),
+                                               before=self._add_moteur_lnk)
+
+        idx = len(self._extra_moteurs_rows) + 2
+
+        row = tk.Frame(self._extra_moteurs_container, bg=C["bg"])
+        row.pack(fill="x", pady=(2, 0))
+        tk.Label(row, text=f"Moteur {idx} / N° Série", bg=C["bg"], font=("Arial", 10),
+                 width=22, anchor="e").pack(side="left", padx=(0, 8))
+
+        var = tk.StringVar(value=initial_ns)
+        combo = SearchableCombobox(row, textvariable=var,
+                                   values=[m["num_serie"] for m in self._moteurs_filtres()],
+                                   width=44)
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_destinataire_candidates())
+
+        entry = {"var": var, "row": row, "combo": combo}
+        self._extra_moteurs_rows.append(entry)
+
+        def _remove(e=entry):
+            e["row"].pack_forget()
+            e["row"].destroy()
+            if e in self._extra_moteurs_rows:
+                self._extra_moteurs_rows.remove(e)
+            # Masquer le container quand il ne reste plus aucun moteur
+            if not self._extra_moteurs_rows:
+                self._extra_moteurs_container.pack_forget()
+            self._refresh_destinataire_candidates()
+
+        btn_x = tk.Label(row, text=" ×", bg=C["bg"], fg="#c62828",
+                         font=("Arial", 13, "bold"), cursor="hand2")
+        btn_x.pack(side="left", padx=(6, 0))
+        btn_x.bind("<Button-1>", lambda _e, r=_remove: r())
+        self._refresh_destinataire_candidates()
+
+    # ─── Totaux live ─────────────────────────────────────────────────────────
+    def _recalc_totaux(self):
+        total_ht = self.lignes_tbl.total_ht()
+        exo = bool(self.exonere_var.get())
+        tva = 0.0 if exo else round(total_ht * 0.20, 2)
+        total_ttc = total_ht if exo else total_ht + tva
+
+        def _fmt(v):
+            return f"{v:,.2f}".replace(",", " ").replace(".", ",") + " €"
+
+        self.total_ht_lbl.config(text=f"Total HT : {_fmt(total_ht)}")
+        self.total_tva_lbl.config(text="TVA exonérée" if exo else f"TVA 20 % : {_fmt(tva)}")
+        self.total_ttc_lbl.config(text=f"Total {'HT (exonéré)' if exo else 'TTC'} : {_fmt(total_ttc)}")
+
+    # ─── Chargement / verrouillage ──────────────────────────────────────────
+    def _load(self):
+        d = db.get_devis(self.devis_id)
+        if not d:
+            messagebox.showerror("Erreur", "Devis introuvable.")
+            self.destroy()
+            return
+        self._devis = d
+        client = None
+        for c in self._clients:
+            if c["id"] == d.get("client_id"):
+                client = c
+                break
+        if client:
+            self.client_combo.set(client["nom"])
+            self._on_client_selected()
+        if d.get("moteur_num_serie"):
+            self.moteur_combo.set(d["moteur_num_serie"])
+
+        # Moteurs supplémentaires
+        try:
+            extra_ms = json.loads(d.get("moteurs_supplementaires_json", "[]") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            extra_ms = []
+        for em in extra_ms:
+            self._add_moteur_row(initial_ns=em.get("num_serie", ""))
+
+        self.destinataire_combo.set(d.get("destinataire_nom", ""))
+        self.destinataire_email_var.set(d.get("destinataire_email", ""))
+        self.destinataire_tel_var.set(d.get("destinataire_telephone", ""))
+        self._refresh_destinataire_candidates()
+
+        self.objet_var.set(d.get("objet", ""))
+        self._navire_combo.set(d.get("navire_nom", ""))
+        self.navire_immat_var.set(d.get("navire_immatriculation", ""))
+        self.navire_pavillon_var.set(d.get("navire_pavillon", ""))
+        self.navire_port_var.set(d.get("navire_port_attache", ""))
+        self.navire_usage_var.set(d.get("navire_type_usage", ""))
+        self.lieu_intervention_var.set(d.get("lieu_intervention", ""))
+        self.txt_description.delete("1.0", "end")
+        self.txt_description.insert("1.0", d.get("description", ""))
+        self.txt_demande_client.delete("1.0", "end")
+        self.txt_demande_client.insert("1.0", d.get("demande_client", ""))
+        self.date_devis_var.set(d.get("date_devis", ""))
+        self.date_validite_var.set(d.get("date_validite", ""))
+        self.statut_var.set(d.get("statut", "Brouillon"))
+        self.exonere_var.set(int(d.get("exonere_tva", 0) or 0))
+        self.lignes_tbl.load(d.get("lignes", []))
+        self.conditions_var.set(d.get("conditions", ""))
+        self.txt_notes.delete("1.0", "end")
+        self.txt_notes.insert("1.0", d.get("notes", ""))
+        self._recalc_totaux()
+        self._refresh_lock_state()
+
+    def _refresh_lock_state(self):
+        """Verrouille le formulaire si le devis a déjà été transformé en bon,
+        et affiche/masque le bouton de transformation selon le statut."""
+        transforme = bool(self._devis and self._devis.get("intervention_id"))
+        if transforme:
+            num_bon = self._devis.get("intervention_num_bon") or "?"
+            self._bandeau.configure(bg="#dbeafe")
+            self._bandeau_lbl.configure(
+                bg="#dbeafe", pady=6,
+                text=f"ℹ️ Ce devis a été transformé en bon d'intervention {num_bon} — "
+                     "seules les notes et conditions restent modifiables.")
+            state = "disabled"
+            self.client_combo.entry.configure(state=state)
+            self.moteur_combo.entry.configure(state=state)
+            self.statut_combo.configure(state=state)
+            self.lignes_tbl.set_state(state)
+            for e in self._extra_moteurs_rows:
+                e["combo"].entry.configure(state=state)
+            self.destinataire_combo.entry.configure(state=state)
+        self._transform_btn.pack_forget()
+        if self.is_edit and not transforme and self.statut_var.get() == "Accepté":
+            self._transform_btn.pack(side="left", padx=6)
+
+    # ─── Sauvegarde ──────────────────────────────────────────────────────────
+    def _save(self, generer_pdf=False):
+        cn = self.client_var.get().strip()
+        if not cn:
+            messagebox.showwarning("Champ manquant", "Le client est obligatoire.")
+            return
+        client = self._client_by_nom.get(cn)
+        if not client:
+            messagebox.showwarning("Client inconnu",
+                f"'{cn}' ne correspond à aucun client connu. Utilisez le bouton "
+                "+ pour en créer un, ou sélectionnez-en un dans la liste.")
+            return
+        moteur = self._moteur_by_ns.get(self.moteur_var.get().strip())
+
+        data = {
+            "client_id": client["id"],
+            "moteur_id": moteur["id"] if moteur else None,
+            "objet": self.objet_var.get().strip(),
+            "description": self.txt_description.get("1.0", "end").strip(),
+            "demande_client": self.txt_demande_client.get("1.0", "end").strip(),
+            "date_devis": self.date_devis_var.get().strip(),
+            "date_validite": self.date_validite_var.get().strip(),
+            "statut": self.statut_var.get(),
+            "navire_nom": self.navire_nom_var.get().strip(),
+            "navire_immatriculation": self.navire_immat_var.get().strip(),
+            "navire_pavillon": self.navire_pavillon_var.get().strip(),
+            "navire_port_attache": self.navire_port_var.get().strip(),
+            "navire_type_usage": self.navire_usage_var.get().strip(),
+            "lieu_intervention": self.lieu_intervention_var.get().strip(),
+            "destinataire_nom": self.destinataire_var.get().strip(),
+            "destinataire_email": self.destinataire_email_var.get().strip(),
+            "destinataire_telephone": self.destinataire_tel_var.get().strip(),
+            "moteurs_supplementaires_json": json.dumps(
+                [
+                    {k: row_get(m, k) for k in ("id", "num_serie", "navire", "machine",
+                                                 "type_moteur", "marque", "ref_constructeur",
+                                                 "date_mise_service", "duree_garantie")}
+                    for e in self._extra_moteurs_rows
+                    if (m := self._moteur_by_ns.get(e["var"].get().strip()))  # noqa: E231
+                ],
+                ensure_ascii=False),
+            "conditions": self.conditions_var.get().strip(),
+            "notes": self.txt_notes.get("1.0", "end").strip(),
+            "exonere_tva": int(self.exonere_var.get()),
+            "lignes": self.lignes_tbl.to_list(),
+        }
+
+        try:
+            if self.is_edit:
+                db.update_devis(self.devis_id, data)
+            else:
+                did, num_devis = db.create_devis(data)
+                self.devis_id = did
+                self.is_edit = True
+        except Exception as exc:
+            messagebox.showerror("Erreur d'enregistrement",
+                f"Impossible d'enregistrer le devis :\n\n{exc}")
+            return
+
+        if self.on_save:
+            self.on_save()
+
+        if generer_pdf:
+            self._generer_pdf()
+
+        messagebox.showinfo("Enregistré", "✅ Devis enregistré.")
+        self._devis = db.get_devis(self.devis_id)
+        self._refresh_lock_state()
+
+    def _generer_pdf(self):
+        import tempfile
+        d = db.get_devis(self.devis_id)
+        if not d:
+            return
+        safe_num = d["num_devis"].replace("/", "-").replace(" ", "_")
+        dest = Path(tempfile.gettempdir()) / f"{safe_num}.pdf"
+        try:
+            db.telecharger_pdf_devis(self.devis_id, dest)
+        except Exception as exc:
+            messagebox.showerror("PDF impossible", f"Impossible de générer le PDF :\n\n{exc}")
+            return
+        ouvrir_fichier(dest)
+
+    def _mail_signataire_inline(self):
+        """Envoie (brouillon) un mail au destinataire du devis — le contact
+        choisi (client ou utilisateur moteur), ou à défaut le contact client —
+        confirmant la prise en compte de la demande d'intervention, avec le
+        devis chiffré joint."""
+        if not self.is_edit:
+            messagebox.showinfo("Sauvegarde requise",
+                "Enregistrez d'abord le devis avant de le transmettre au signataire.")
+            return
+        d = db.get_devis(self.devis_id)
+        if not d:
+            messagebox.showerror("Erreur", "Devis introuvable.")
+            return
+        client = self._client_by_nom.get(d.get("client_nom")) or \
+            next((c for c in self._clients if c["id"] == d.get("client_id")), None)
+        if not d.get("destinataire_email") and (not client or not row_get(client, "email")):
+            messagebox.showwarning("Email manquant",
+                "Aucun email renseigné pour le destinataire du devis (ni sur la fiche client).")
+            return
+        moteur = self._moteur_by_ns.get(d.get("moteur_num_serie")) if d.get("moteur_num_serie") else None
+
+        import tempfile
+        safe_num = d["num_devis"].replace("/", "-").replace(" ", "_")
+        dest = Path(tempfile.gettempdir()) / f"{safe_num}.pdf"
+        try:
+            db.telecharger_pdf_devis(self.devis_id, dest)
+        except Exception as exc:
+            messagebox.showerror("PDF impossible",
+                f"Impossible de générer le devis en PDF :\n\n{exc}")
+            return
+
+        _, pj_auto = mailer.email_devis(d, client, moteur, str(dest))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le devis manuellement depuis le dossier qui vient de s'ouvrir :\n{dest.parent}")
+
+    # ─── Transformation en bon d'intervention ───────────────────────────────
+    def _transformer(self):
+        if not self.is_edit:
+            return
+        if self.statut_var.get() != "Accepté":
+            messagebox.showwarning("Transformation impossible",
+                "Seul un devis au statut 'Accepté' peut être transformé en bon.")
+            return
+        if not messagebox.askyesno("Transformer en bon",
+                "Créer un bon d'intervention à partir de ce devis ?\n\n"
+                "Le devis passera au statut 'Transformé' et ne sera plus modifiable "
+                "(hormis notes et conditions)."):
+            return
+        try:
+            res = db.transformer_devis(self.devis_id)
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Transformation impossible :\n\n{exc}")
+            return
+        if self.on_save:
+            self.on_save()
+        inv_id = res["intervention_id"]
+        parent = self.master
+        app = self.app
+        on_save = self.on_save
+        self.destroy()
+        BonDialog(parent, app, inv_id=inv_id, on_save=on_save)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVIS — liste
+# ══════════════════════════════════════════════════════════════════════════════
+class DevisFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C["bg"])
+        self.app = app
+        mk_header(self, "Devis", "   Devis chiffrés")
+
+        sf = tk.Frame(self, bg=C["bg"])
+        sf.pack(fill="x", padx=20, pady=8)
+        tk.Label(sf, text="🔍 Recherche :", bg=C["bg"], font=("Arial", 10)).pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Entry(sf, textvariable=self.search_var, width=24).pack(side="left", padx=4)
+
+        tk.Label(sf, text="  Statut :", bg=C["bg"], font=("Arial", 10)).pack(side="left", padx=(12, 4))
+        self.statut_var = tk.StringVar(value="Tous")
+        ttk.Combobox(sf, textvariable=self.statut_var,
+                     values=["Tous"] + STATUTS_DEVIS, width=14, state="readonly").pack(side="left")
+        self.statut_var.trace_add("write", lambda *_: self.refresh())
+
+        cols = ("num_devis", "date", "validite", "client", "moteur", "objet", "statut", "total_ttc")
+        col_defs = [
+            ("num_devis", "N° Devis", 120), ("date", "Date", 90), ("validite", "Validité", 90),
+            ("client", "Client", 160), ("moteur", "Moteur", 110), ("objet", "Objet", 200),
+            ("statut", "Statut", 100), ("total_ttc", "Total TTC", 100),
+        ]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=22)
+        tf.pack(fill="both", expand=True, padx=20, pady=4)
+
+        af = tk.Frame(self, bg=C["bg"])
+        af.pack(fill="x", padx=20, pady=8)
+        mk_btn(af, "➕ Nouveau devis", self._nouveau).pack(side="left", padx=3)
+        mk_btn(af, "✏️ Modifier", self._modifier).pack(side="left", padx=3)
+        mk_btn(af, "📄 Générer PDF", self._generer_pdf, color=C["btn2"]).pack(side="left", padx=3)
+        mk_btn(af, "📧 Envoyer par mail", self._envoyer_mail, color=C["btn2"]).pack(side="left", padx=3)
+        mk_btn(af, "🔁 Transformer en bon", self._transformer, color=C["btn2"]).pack(side="left", padx=3)
+        mk_btn(af, "🗑️ Supprimer", self._supprimer, color=C["danger"]).pack(side="left", padx=3)
+        self.tree.bind("<Double-1>", lambda e: self._modifier())
+        self._cache = []
+
+    def refresh(self):
+        import threading
+        statut = self.statut_var.get()
+        search = self.search_var.get()
+
+        def _bg():
+            try:
+                devis = list(db.get_devis_liste(statut=statut, search=search))
+            except Exception:
+                devis = None
+            try:
+                self.after(0, lambda: self._apply_refresh(devis))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_refresh(self, devis):
+        if devis is None:
+            self.tree.delete(*self.tree.get_children())
+            self.tree.insert("", "end", iid="0",
+                             values=("", "Hors ligne", "", "Serveur inaccessible", "", "", "", ""))
+            self._cache = []
+            return
+        self._cache = devis
+        rows = []
+        for r in self._cache:
+            total_ttc = r.get("total_ttc", 0) or 0
+            rows.append((
+                r["num_devis"], r.get("date_devis", ""), r.get("date_validite", ""),
+                r.get("client_nom") or "", r.get("moteur_num_serie") or "",
+                r.get("objet", ""), r["statut"],
+                f"{total_ttc:,.2f}".replace(",", " ").replace(".", ",") + " €",
+            ))
+        fill_tree(self.tree, rows)
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un devis.")
+            return None
+        return self._cache[int(sel[0])]
+
+    def _nouveau(self):
+        DevisDialog(self, self.app, on_save=self.refresh)
+
+    def _modifier(self):
+        r = self._sel()
+        if r:
+            DevisDialog(self, self.app, devis_id=r["id"], on_save=self.refresh)
+
+    def _generer_pdf(self):
+        r = self._sel()
+        if not r:
+            return
+        import tempfile
+        import threading
+        safe_num = r["num_devis"].replace("/", "-").replace(" ", "_")
+        dest = Path(tempfile.gettempdir()) / f"{safe_num}.pdf"
+
+        def _bg():
+            try:
+                db.telecharger_pdf_devis(r["id"], dest)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror(
+                    "PDF impossible", f"Impossible de générer le PDF :\n\n{exc}"))
+                return
+            self.after(0, lambda: ouvrir_fichier(dest))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _envoyer_mail(self):
+        """Envoie (brouillon) un mail au destinataire du devis sélectionné —
+        le contact choisi sur le devis (client ou utilisateur moteur), ou à
+        défaut le contact renseigné sur la fiche client —, avec le devis
+        chiffré joint. Reprend la même logique que DevisDialog._mail_signataire_inline."""
+        r = self._sel()
+        if not r:
+            return
+        d = db.get_devis(r["id"])
+        if not d:
+            messagebox.showerror("Erreur", "Devis introuvable.")
+            return
+        client = db.get_client(d["client_id"]) if d.get("client_id") else None
+        if not d.get("destinataire_email") and (not client or not row_get(client, "email")):
+            messagebox.showwarning("Email manquant",
+                "Aucun email renseigné pour le destinataire du devis (ni sur la fiche client).")
+            return
+        moteur = db.get_moteur(d["moteur_id"]) if d.get("moteur_id") else None
+
+        import tempfile
+        safe_num = d["num_devis"].replace("/", "-").replace(" ", "_")
+        dest = Path(tempfile.gettempdir()) / f"{safe_num}.pdf"
+        try:
+            db.telecharger_pdf_devis(d["id"], dest)
+        except Exception as exc:
+            messagebox.showerror("PDF impossible",
+                f"Impossible de générer le devis en PDF :\n\n{exc}")
+            return
+
+        _, pj_auto = mailer.email_devis(d, client, moteur, str(dest))
+        if not pj_auto:
+            messagebox.showinfo("Pièce jointe",
+                f"Joignez le devis manuellement depuis le dossier qui vient de s'ouvrir :\n{dest.parent}")
+
+    def _transformer(self):
+        r = self._sel()
+        if not r:
+            return
+        if r["statut"] != "Accepté":
+            messagebox.showwarning("Transformation impossible",
+                "Seul un devis au statut 'Accepté' peut être transformé en bon.")
+            return
+        if not messagebox.askyesno("Transformer en bon",
+                f"Créer un bon d'intervention à partir du devis {r['num_devis']} ?"):
+            return
+        try:
+            res = db.transformer_devis(r["id"])
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Transformation impossible :\n\n{exc}")
+            return
+        self.refresh()
+        BonDialog(self, self.app, inv_id=res["intervention_id"],
+                  on_save=lambda: self.app.frames["interventions"].refresh()
+                  if "interventions" in self.app.frames else None)
+
+    def _supprimer(self):
+        r = self._sel()
+        if not r:
+            return
+        if not messagebox.askyesno("Supprimer", f"Supprimer le devis {r['num_devis']} ?"):
+            return
+        db.delete_devis(r["id"])
+        self.refresh()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DIALOG IMPORT CSV (parc moteurs & clients)
 # ══════════════════════════════════════════════════════════════════════════════
 class ImportCSVDialog(tk.Toplevel):
@@ -7292,29 +9202,34 @@ class ImportCSVDialog(tk.Toplevel):
     - options de dédoublonnage
     """
 
-    # Libellés français pour les champs DB — mapping fixe affiché par défaut
+    # Libellés français pour les champs DB — alignés sur MoteurDialog.FIELDS
+    # (table `moteurs`), mapping fixe affiché par défaut
     FIELD_LABELS = [
         ("nom_client",       "Nom client (Tiers) *"),
         ("type_client",      "Type Client"),
-        ("navire",           "Machine / Engin (Navire)"),
         ("num_serie",        "N° de Série *"),
-        ("num_moteur",       "N° Moteur"),
-        ("cylindree",        "Cylindrée"),
-        ("famille",          "Famille"),
+        ("navire",           "Navire / Site"),
+        ("navire_immatriculation", "Immatriculation navire"),
+        ("navire_port_attache",    "Port d'attache"),
+        ("machine",          "Machine"),
+        ("marque",           "Marque"),
+        ("type_moteur",      "Type moteur / inverseur"),
         ("ref_constructeur", "Réf. Constructeur"),
         ("application",      "Application"),
-        ("type_moteur",      "Type moteur"),
         ("typologie",        "Typologie"),
-        ("marque",           "Marque"),
-        ("collection",       "Collection"),
+        ("puissance_rpm",         "Puissance/RPM"),
+        ("puissance_pme_rpm",     "Puissance PME/RPM"),
         ("code_affaire",     "Code Affaire"),
-    ]
-
-    # Champs ajoutables manuellement via le bouton "+"
-    EXTRA_FIELD_LABELS = [
         ("date_mise_service", "Date de mise en service"),
         ("duree_garantie",    "Durée de garantie (mois)"),
-        ("machine",           "Machine (type)"),
+    ]
+
+    # Champs ajoutables manuellement via le bouton "+" (client utilisateur final)
+    EXTRA_FIELD_LABELS = [
+        ("client_utilisateur_nom",     "Client utilisateur"),
+        ("client_utilisateur_email",   "Email utilisateur"),
+        ("client_utilisateur_tel",     "Tél. utilisateur"),
+        ("client_utilisateur_adresse", "Adresse utilisateur"),
     ]
 
     def __init__(self, parent, app, on_save=None):
@@ -7344,11 +9259,22 @@ class ImportCSVDialog(tk.Toplevel):
         self.btn_simulate.pack(side="left", padx=6)
         self.btn_import = mk_btn(bf, "📥 Lancer l'import", self._import_real, color=C["btn2"])
         self.btn_import.pack(side="left", padx=6)
-        mk_btn(bf, "Fermer", self.destroy, color="#888").pack(side="left", padx=6)
+        self.btn_close = mk_btn(bf, "Fermer", self.destroy, color="#888")
+        self.btn_close.pack(side="left", padx=6)
 
         # Désactivés tant qu'aucun fichier n'est chargé
         self.btn_simulate.config(state="disabled")
         self.btn_import.config(state="disabled")
+
+        # Barre de progression (affichée uniquement pendant simulation/import)
+        self._busy = False
+        self.progress_frame = tk.Frame(self, bg=C["bg"])
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient="horizontal",
+                                             mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", padx=14)
+        self.progress_lbl = tk.Label(self.progress_frame, text="",
+                                      bg=C["bg"], font=("Arial", 9), fg="#444")
+        self.progress_lbl.pack(anchor="w", padx=14, pady=(2, 6))
 
         # Bandeau en-tête
         tk.Label(self, text="📥 Import du parc moteurs & clients",
@@ -7575,14 +9501,7 @@ class ImportCSVDialog(tk.Toplevel):
             messagebox.showwarning("Mapping incomplet",
                 "Vous devez mapper au moins le N° de série OU le nom client.")
             return
-        try:
-            stats = csv_importer.import_rows(
-                self.csv_path, mapping, self.delimiter, self.encoding,
-                skip_empty_serie=bool(self.skip_empty_var.get()), dry_run=True)
-        except Exception as e:
-            messagebox.showerror("Erreur de simulation", str(e))
-            return
-        self._show_stats("Résultat de la simulation (aucune donnée écrite)", stats, color="#084298")
+        self._run_import(mapping, dry_run=True)
 
     def _import_real(self):
         if not self.csv_path: return
@@ -7596,15 +9515,74 @@ class ImportCSVDialog(tk.Toplevel):
                 "Les moteurs avec un N° de série existant seront MIS À JOUR.\n"
                 "Les clients avec un nom déjà connu seront RÉUTILISÉS."):
             return
-        try:
-            stats = csv_importer.import_rows(
-                self.csv_path, mapping, self.delimiter, self.encoding,
-                skip_empty_serie=bool(self.skip_empty_var.get()), dry_run=False)
-        except Exception as e:
-            messagebox.showerror("Erreur d'import", str(e))
+        self._run_import(mapping, dry_run=False)
+
+    def _run_import(self, mapping, dry_run):
+        """Exécute la simulation/l'import dans un thread séparé (pour ne pas
+        geler l'UI) et alimente la barre de progression en temps réel."""
+        import threading
+        self._set_busy(True, "Simulation en cours…" if dry_run else "Import en cours…")
+
+        last_pct = {"value": -1}
+
+        def _progress_cb(current, total):
+            pct = int(current * 100 / total) if total else 100
+            if pct == last_pct["value"] and current != total:
+                return
+            last_pct["value"] = pct
+            try:
+                self.after(0, self._update_progress, current, total, pct)
+            except Exception:
+                pass
+
+        def _bg():
+            stats, err = None, None
+            try:
+                stats = csv_importer.import_rows(
+                    self.csv_path, mapping, self.delimiter, self.encoding,
+                    skip_empty_serie=bool(self.skip_empty_var.get()),
+                    dry_run=dry_run, progress_cb=_progress_cb)
+            except Exception as e:
+                err = e
+            try:
+                self.after(0, lambda: self._on_import_done(stats, err, dry_run))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _set_busy(self, busy, label=""):
+        self._busy = busy
+        for b in (self.btn_simulate, self.btn_import, self.btn_close):
+            b.config(state="disabled" if busy else "normal")
+        if busy:
+            self.progress_bar["value"] = 0
+            self.progress_lbl.config(text=label)
+            self.progress_frame.pack(side="bottom", fill="x", pady=(0, 4))
+        else:
+            self.progress_frame.pack_forget()
+
+    def _update_progress(self, current, total, pct):
+        self.progress_bar["value"] = pct
+        self.progress_lbl.config(
+            text=f"{current} / {total} ligne(s) traitée(s) — {pct} %")
+
+    def _on_import_done(self, stats, err, dry_run):
+        self._set_busy(False)
+        if err is not None:
+            messagebox.showerror(
+                "Erreur de simulation" if dry_run else "Erreur d'import", str(err))
             return
-        self._show_stats("Import terminé", stats, color="#0f5132")
-        if self.on_save:
+
+        title = "Résultat de la simulation (aucune donnée écrite)" if dry_run else "Import terminé"
+        color = "#084298" if dry_run else "#0f5132"
+        if not dry_run:
+            ecrits = stats["moteurs_crees"] + stats["moteurs_mis_a_jour"]
+            if stats["lignes_total"] > 0 and ecrits == 0 and stats["erreurs"]:
+                title = "⚠ Import échoué — aucune donnée écrite en base"
+                color = C["danger"]
+        self._show_stats(title, stats, color=color)
+        if not dry_run and self.on_save:
             self.on_save()
 
     def _show_stats(self, title, stats, color="#003366"):
