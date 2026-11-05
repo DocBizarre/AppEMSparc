@@ -2559,7 +2559,10 @@ class MoteursFrame(tk.Frame):
         elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
         else: gtxt = "—"
         code_affaire = m.get("code_affaire", "")
-        atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") and code_affaire else "—"
+        if code_affaire:
+            atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") else code_affaire
+        else:
+            atxt = "—"
         return (m.get("num_serie", ""), m.get("client_nom", "") or "",
                 row_get(m, "navire"), row_get(m, "marque"), row_get(m, "machine"),
                 row_get(m, "type_moteur"), m.get("date_mise_service", ""),
@@ -2770,7 +2773,10 @@ class MoteursFrame(tk.Frame):
         elif statut == "Expirée": gtxt = f"Expirée · -{jours}j"
         else: gtxt = "—"
         code_affaire = m.get("code_affaire", "")
-        atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") and code_affaire else "—"
+        if code_affaire:
+            atxt = f"🔗 {code_affaire}" if m.get("affaire_liee") else code_affaire
+        else:
+            atxt = "—"
         return (
             row_get(m, "num_serie"), row_get(m, "client_nom"),
             row_get(m, "navire"), row_get(m, "navire_immatriculation"),
