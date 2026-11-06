@@ -1031,9 +1031,10 @@ class AppEMS(tk.Tk):
     # Onglets visibles selon le mode de l'application
     NAV_PARELEMENTS = {
         "bons": ["dashboard", "interventions", "devis", "import_export", "nouveau"],
-        "parc": ["clients", "moteurs", "contacts", "techniciens"],
+        "parc": ["clients", "moteurs", "contacts", "fournisseurs", "references", "techniciens"],
         "full": ["dashboard", "interventions", "devis", "clients",
-                 "moteurs", "contacts", "techniciens", "import_export", "nouveau"],
+                 "moteurs", "contacts", "fournisseurs", "references", "techniciens",
+                 "import_export", "nouveau"],
     }
     TITRES = {
         "bons": "EMS – Bons d'intervention",
@@ -1273,6 +1274,8 @@ class AppEMS(tk.Tk):
             ("clients",       "👥", "Clients"),
             ("moteurs",       "⚙",  "Moteurs"),
             ("contacts",      "📇", "Contacts"),
+            ("fournisseurs",  "🏭", "Fournisseurs"),
+            ("references",    "📦", "Références produits"),
             ("techniciens",   "🔨", "Techniciens"),
             ("import_export", "🔄", "Import / Export"),
             ("nouveau",       "➕", "Nouveau bon"),
@@ -1355,6 +1358,8 @@ class AppEMS(tk.Tk):
             (ClientsFrame,        "clients"),
             (MoteursFrame,        "moteurs"),
             (ContactsFrame,       "contacts"),
+            (FournisseursFrame,   "fournisseurs"),
+            (ReferencesFrame,     "references"),
             (TechniciensFrame,    "techniciens"),
             (ImportExportFrame,   "import_export"),
             (NouveauFrame,        "nouveau"),
@@ -2997,6 +3002,91 @@ class ContactsFrame(tk.Frame):
             self._resoudre_doublons(reste)
 
         DoublonContactDialog(self, self.app, group, on_done=_on_done)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOURNISSEURS (base des achats — alimentée par l'app Affaire)
+# ══════════════════════════════════════════════════════════════════════════════
+class FournisseursFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C["bg"])
+        self.app = app
+        mk_header(self, "Fournisseurs", "   Base des achats — alimentée automatiquement "
+                                         "par les bons de commande et intentions d'achat")
+
+        sf = tk.Frame(self, bg=C["bg"])
+        sf.pack(fill="x", padx=20, pady=8)
+        tk.Label(sf, text="🔍 Recherche :", bg=C["bg"], font=("Arial",10)).pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Entry(sf, textvariable=self.search_var, width=30).pack(side="left", padx=4)
+        mk_btn(sf, "➕ Nouveau fournisseur",
+               lambda: FournisseurDialog(self, self.app, on_save=self.refresh)).pack(side="right")
+        mk_btn(sf, "📤 Exporter", self._exporter,
+               color=C["btn2"]).pack(side="right", padx=(0, 6))
+
+        cols = ("nom","contact","email","telephone","ville","pays","refs","usage")
+        col_defs = [("nom","Nom",210),("contact","Contact",150),("email","Email",210),
+                    ("telephone","Téléphone",120),("ville","Ville",120),("pays","Pays",80),
+                    ("refs","Références",85,"center"),("usage","Utilisations",85,"center")]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=22)
+        tf.pack(fill="both", expand=True, padx=20, pady=4)
+
+        af = tk.Frame(self, bg=C["bg"])
+        af.pack(fill="x", padx=20, pady=8)
+        mk_btn(af, "✏️ Modifier", self._modifier).pack(side="left", padx=4)
+        mk_btn(af, "📦 Ses références", self._references).pack(side="left", padx=4)
+        mk_btn(af, "🗑️ Supprimer", self._supprimer, color=C["danger"]).pack(side="left", padx=4)
+        tk.Label(af, text="La suppression retire seulement le fournisseur de la précomplétion ; "
+                          "les bons de commande existants ne sont pas modifiés.",
+                 bg=C["bg"], fg=C["text_muted"], font=F["small"]).pack(side="left", padx=12)
+        self.tree.bind("<Double-1>", lambda e: self._modifier())
+        self._cache = []
+
+    @staticmethod
+    def _row(f):
+        return (f["nom"], f.get("contact", ""), f.get("email", ""), f.get("telephone", ""),
+                f.get("ville", ""), f.get("pays", ""), f.get("nb_references", 0) or "",
+                f.get("usage_count", 0))
+
+    def refresh(self):
+        self._cache = list(db.get_fournisseurs(search=self.search_var.get()))
+        fill_tree(self.tree, [self._row(f) for f in self._cache])
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection","Sélectionnez un fournisseur."); return None
+        return self._cache[int(sel[0])]
+
+    def _modifier(self):
+        r = self._sel()
+        if r: FournisseurDialog(self, self.app, dict(r), on_save=self.refresh)
+
+    def _references(self):
+        r = self._sel()
+        if not r:
+            return
+        frame = getattr(self.app, "frames", {}).get("references")
+        if frame is None:
+            messagebox.showinfo("Références", "L'onglet Références produits n'est pas disponible ici.")
+            return
+        self.app.show("references")
+        frame.filtrer_fournisseur(r["nom"])
+
+    def _supprimer(self):
+        r = self._sel()
+        if r and messagebox.askyesno("Supprimer", f"Supprimer le fournisseur '{r['nom']}' ?\n\n"
+                                     "Ses liens avec les références produits seront aussi retirés."):
+            db.delete_fournisseur(r["id"]); self.refresh()
+
+    def _exporter(self):
+        headers = ["Nom", "Contact", "Email", "Téléphone", "Rue", "Code postal",
+                   "Ville", "Pays", "Utilisations"]
+        rows = [(f["nom"], f.get("contact", ""), f.get("email", ""), f.get("telephone", ""),
+                 f.get("rue", ""), f.get("code_postal", ""), f.get("ville", ""),
+                 f.get("pays", ""), f.get("usage_count", 0)) for f in self._cache]
+        export_rows_to_csv(self, "fournisseurs.csv", headers, rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6270,6 +6360,55 @@ class ContactDialog(tk.Toplevel):
         self.destroy()
 
 
+class FournisseurDialog(tk.Toplevel):
+    FIELDS = [("nom","Nom *"),("contact","Contact"),("email","Email"),("telephone","Téléphone"),
+              ("rue","Rue"),("code_postal","Code postal"),("ville","Ville"),("pays","Pays")]
+
+    def __init__(self, parent, app, fournisseur=None, on_save=None):
+        super().__init__(parent)
+        self.app = app; self.fournisseur = fournisseur; self.on_save = on_save
+        self.title("Nouveau fournisseur" if not fournisseur
+                   else f"Modifier – {fournisseur['nom']}")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.grab_set()
+        self.v = {k: tk.StringVar(value=(fournisseur.get(k) or "") if fournisseur else "")
+                  for k, _ in self.FIELDS}
+        f = tk.Frame(self, bg=C["bg"]); f.pack(padx=24, pady=18)
+        for i, (key, lbl) in enumerate(self.FIELDS):
+            tk.Label(f, text=lbl, bg=C["bg"], font=("Arial",10),
+                     anchor="e", width=14).grid(row=i, column=0, sticky="e", padx=(0,6), pady=4)
+            if key == "email":
+                EmailEntry(f, textvariable=self.v[key], width=40).grid(row=i, column=1, pady=4)
+            else:
+                ttk.Entry(f, textvariable=self.v[key], width=40).grid(row=i, column=1, pady=4)
+        bf = tk.Frame(self, bg=C["bg"]); bf.pack(pady=12)
+        mk_btn(bf,"💾 Enregistrer",self._save).pack(side="left",padx=8)
+        mk_btn(bf,"Annuler",self.destroy,color="#888").pack(side="left",padx=8)
+
+    def _save(self):
+        nom = self.v["nom"].get().strip()
+        if not nom: messagebox.showwarning("Champ requis","Le nom est obligatoire."); return
+        email = self.v["email"].get().strip()
+        if email and not db.email_looks_valid(email):
+            if not messagebox.askyesno("Format email douteux",
+                    f"L'email '{email}' semble mal formé.\n\n"
+                    "Voulez-vous quand même l'enregistrer ?"):
+                return
+        try:
+            db.upsert_fournisseur({k: self.v[k].get().strip() for k in self.v},
+                                  fournisseur_id=self.fournisseur["id"] if self.fournisseur else None)
+        except db.APIError as e:
+            messagebox.showerror("Enregistrement impossible", str(e), parent=self)
+            return
+        if self.on_save:
+            try:
+                self.on_save(nom)
+            except TypeError:
+                self.on_save()
+        self.destroy()
+
+
 class DoublonContactDialog(tk.Toplevel):
     """Demande à l'utilisateur quel contact conserver parmi un groupe de doublons
     (même email et/ou même téléphone). Les autres contacts du groupe sont supprimés."""
@@ -9238,11 +9377,55 @@ class ImportCSVDialog(tk.Toplevel):
         ("client_utilisateur_adresse", "Adresse utilisateur"),
     ]
 
+    # ── Paramètres surchargeables (cf. ImportPiecesCSVDialog) ────────────────
+    WINDOW_TITLE  = "Importer le parc depuis un CSV"
+    HEADER_TEXT   = "📥 Import du parc moteurs & clients"
+    FILE_TITLE    = "Sélectionner le fichier CSV du parc"
+    ALIASES_MAP   = None    # None = csv_importer.DEFAULT_MAPPING (parc moteurs)
+    OPTION_LABEL  = "Ignorer les lignes sans N° de série (recommandé pour les réimports)"
+    OPTION_DEFAULT = 0
+
+    def _build_extra_options(self, parent):
+        """Options propres à une variante d'import (aucune pour le parc)."""
+
+    def _validate_mapping(self, mapping):
+        """Message d'erreur si le mapping est insuffisant, sinon None."""
+        if mapping.get("num_serie") is None and mapping.get("nom_client") is None:
+            return "Vous devez mapper au moins le N° de série OU le nom client."
+        return None
+
+    def _confirm_text(self):
+        return (f"Importer {self.total_lines} ligne(s) dans la base ?\n\n"
+                "Les moteurs avec un N° de série existant seront MIS À JOUR.\n"
+                "Les clients avec un nom déjà connu seront RÉUTILISÉS.")
+
+    def _run_rows(self, mapping, dry_run, progress_cb):
+        return csv_importer.import_rows(
+            self.csv_path, mapping, self.delimiter, self.encoding,
+            skip_empty_serie=bool(self.skip_empty_var.get()),
+            dry_run=dry_run, progress_cb=progress_cb)
+
+    def _import_failed(self, stats):
+        ecrits = stats["moteurs_crees"] + stats["moteurs_mis_a_jour"]
+        return stats["lignes_total"] > 0 and ecrits == 0 and bool(stats["erreurs"])
+
+    def _stats_rows(self, stats):
+        return [
+            ("Lignes traitées",     stats["lignes_total"]),
+            ("Lignes ignorées",     stats["lignes_ignorees"]),
+            ("Clients créés",       stats["clients_crees"]),
+            ("Clients existants",   stats["clients_existants"]),
+            ("Moteurs créés",       stats["moteurs_crees"]),
+            ("Moteurs mis à jour",  stats["moteurs_mis_a_jour"]),
+            ("Doublons N° série",   stats["moteurs_doublons"]),
+            ("Erreurs",             len(stats["erreurs"])),
+        ]
+
     def __init__(self, parent, app, on_save=None):
         super().__init__(parent)
         self.app = app
         self.on_save = on_save
-        self.title("Importer le parc depuis un CSV")
+        self.title(self.WINDOW_TITLE)
         self.geometry("960x720")
         self.configure(bg=C["bg"])
         self.grab_set()
@@ -9283,7 +9466,7 @@ class ImportCSVDialog(tk.Toplevel):
         self.progress_lbl.pack(anchor="w", padx=14, pady=(2, 6))
 
         # Bandeau en-tête
-        tk.Label(self, text="📥 Import du parc moteurs & clients",
+        tk.Label(self, text=self.HEADER_TEXT,
                  font=("Arial", 13, "bold"), bg=C["bg"], fg=C["header"]).pack(pady=(12, 2))
         tk.Label(self,
                  text="1. Sélectionnez votre fichier CSV   →   2. Vérifiez le mapping des colonnes   "
@@ -9310,10 +9493,11 @@ class ImportCSVDialog(tk.Toplevel):
         # Options en bas du mapping
         opt_f = tk.Frame(self, bg=C["bg"])
         opt_f.pack(fill="x", padx=14, pady=(0, 4))
-        self.skip_empty_var = tk.IntVar(value=0)
+        self.skip_empty_var = tk.IntVar(value=self.OPTION_DEFAULT)
         tk.Checkbutton(opt_f,
-            text="Ignorer les lignes sans N° de série (recommandé pour les réimports)",
+            text=self.OPTION_LABEL,
             variable=self.skip_empty_var, bg=C["bg"], font=("Arial", 9)).pack(anchor="w")
+        self._build_extra_options(opt_f)
 
         # Placeholders initiaux
         tk.Label(self.mapping_tab,
@@ -9325,12 +9509,13 @@ class ImportCSVDialog(tk.Toplevel):
 
     def _choose_file(self):
         path = filedialog.askopenfilename(
-            title="Sélectionner le fichier CSV du parc",
-            filetypes=[("Fichiers CSV", "*.csv"), ("Tous", "*.*")])
+            title=self.FILE_TITLE,
+            filetypes=[("Fichiers CSV", "*.csv"), ("Tous", "*.*")], parent=self)
         if not path:
             return
         try:
-            hd, prev, total, mapping, delim, enc = csv_importer.read_csv_preview(path)
+            hd, prev, total, mapping, delim, enc = csv_importer.read_csv_preview(
+                path, aliases_map=self.ALIASES_MAP)
         except Exception as e:
             messagebox.showerror("Lecture impossible",
                                   f"Impossible de lire le fichier :\n{e}")
@@ -9394,6 +9579,9 @@ class ImportCSVDialog(tk.Toplevel):
                          width=42, state="readonly").pack(side="left", fill="x", expand=True)
 
         # ── Liaisons supplémentaires ─────────────────────────────────────────
+        if not self.EXTRA_FIELD_LABELS:
+            self._extra_cont = tk.Frame(inner, bg=C["bg"])
+            return
         tk.Frame(inner, bg="#c0c8d0", height=1).pack(fill="x", padx=4, pady=(12, 4))
         hdr_extra = tk.Frame(inner, bg=C["bg"])
         hdr_extra.pack(fill="x", padx=4, pady=(0, 4))
@@ -9503,23 +9691,20 @@ class ImportCSVDialog(tk.Toplevel):
     def _simulate(self):
         if not self.csv_path: return
         mapping = self._build_mapping_from_ui()
-        if mapping.get("num_serie") is None and mapping.get("nom_client") is None:
-            messagebox.showwarning("Mapping incomplet",
-                "Vous devez mapper au moins le N° de série OU le nom client.")
+        err = self._validate_mapping(mapping)
+        if err:
+            messagebox.showwarning("Mapping incomplet", err, parent=self)
             return
         self._run_import(mapping, dry_run=True)
 
     def _import_real(self):
         if not self.csv_path: return
         mapping = self._build_mapping_from_ui()
-        if mapping.get("num_serie") is None and mapping.get("nom_client") is None:
-            messagebox.showwarning("Mapping incomplet",
-                "Vous devez mapper au moins le N° de série OU le nom client.")
+        err = self._validate_mapping(mapping)
+        if err:
+            messagebox.showwarning("Mapping incomplet", err, parent=self)
             return
-        if not messagebox.askyesno("Confirmer l'import",
-                f"Importer {self.total_lines} ligne(s) dans la base ?\n\n"
-                "Les moteurs avec un N° de série existant seront MIS À JOUR.\n"
-                "Les clients avec un nom déjà connu seront RÉUTILISÉS."):
+        if not messagebox.askyesno("Confirmer l'import", self._confirm_text(), parent=self):
             return
         self._run_import(mapping, dry_run=False)
 
@@ -9544,10 +9729,7 @@ class ImportCSVDialog(tk.Toplevel):
         def _bg():
             stats, err = None, None
             try:
-                stats = csv_importer.import_rows(
-                    self.csv_path, mapping, self.delimiter, self.encoding,
-                    skip_empty_serie=bool(self.skip_empty_var.get()),
-                    dry_run=dry_run, progress_cb=_progress_cb)
+                stats = self._run_rows(mapping, dry_run, _progress_cb)
             except Exception as e:
                 err = e
             try:
@@ -9582,11 +9764,9 @@ class ImportCSVDialog(tk.Toplevel):
 
         title = "Résultat de la simulation (aucune donnée écrite)" if dry_run else "Import terminé"
         color = "#084298" if dry_run else "#0f5132"
-        if not dry_run:
-            ecrits = stats["moteurs_crees"] + stats["moteurs_mis_a_jour"]
-            if stats["lignes_total"] > 0 and ecrits == 0 and stats["erreurs"]:
-                title = "⚠ Import échoué — aucune donnée écrite en base"
-                color = C["danger"]
+        if not dry_run and self._import_failed(stats):
+            title = "⚠ Import échoué — aucune donnée écrite en base"
+            color = C["danger"]
         self._show_stats(title, stats, color=color)
         if not dry_run and self.on_save:
             self.on_save()
@@ -9602,17 +9782,7 @@ class ImportCSVDialog(tk.Toplevel):
 
         f = tk.Frame(win, bg=C["bg"])
         f.pack(padx=20, pady=4, fill="both", expand=True)
-        rows = [
-            ("Lignes traitées",     stats["lignes_total"]),
-            ("Lignes ignorées",     stats["lignes_ignorees"]),
-            ("Clients créés",       stats["clients_crees"]),
-            ("Clients existants",   stats["clients_existants"]),
-            ("Moteurs créés",       stats["moteurs_crees"]),
-            ("Moteurs mis à jour",  stats["moteurs_mis_a_jour"]),
-            ("Doublons N° série",   stats["moteurs_doublons"]),
-            ("Erreurs",             len(stats["erreurs"])),
-        ]
-        for label, val in rows:
+        for label, val in self._stats_rows(stats):
             r = tk.Frame(f, bg=C["bg"])
             r.pack(fill="x", pady=2)
             tk.Label(r, text=label, bg=C["bg"], font=("Arial", 10),
@@ -9628,12 +9798,294 @@ class ImportCSVDialog(tk.Toplevel):
                           relief="solid", bd=1)
             tx.pack(fill="both", expand=True)
             for ln, msg in stats["erreurs"][:20]:
-                tx.insert("end", f"  Ligne {ln}: {msg}\n")
+                tx.insert("end", f"  Ligne {ln}: {msg}\n" if ln else f"  {msg}\n")
             if len(stats["erreurs"]) > 20:
                 tx.insert("end", f"  ... et {len(stats['erreurs']) - 20} autres\n")
             tx.config(state="disabled")
 
         mk_btn(win, "Fermer", win.destroy).pack(pady=10)
+
+
+class ImportPiecesCSVDialog(ImportCSVDialog):
+    """Import CSV du catalogue des références produits (table `pieces`),
+    proposées ensuite dans les lignes des bons de commande et intentions
+    d'achat de l'app Affaire. Même écran que l'import du parc : affectation
+    de chaque champ de la table à une colonne du fichier, aperçu, simulation."""
+
+    FIELD_LABELS = [
+        ("reference",  "Référence produit *"),
+        ("libelle",    "Désignation"),
+        ("marque",     "Marque"),
+        ("prix_achat", "Prix d'achat HT"),
+        ("prix_vente", "Prix de vente HT"),
+        ("notes",      "Notes"),
+        ("fournisseur",     "Fournisseur"),
+        ("ref_fournisseur", "Réf. chez le fournisseur"),
+    ]
+    EXTRA_FIELD_LABELS = []
+
+    def _build_extra_options(self, parent):
+        row = tk.Frame(parent, bg=C["bg"])
+        row.pack(anchor="w", pady=(4, 0))
+        tk.Label(row, text="Fournisseur du fichier (lignes sans colonne Fournisseur) :",
+                 bg=C["bg"], font=("Arial", 9)).pack(side="left")
+        self.fournisseur_defaut_var = tk.StringVar()
+        try:
+            noms = sorted({f["nom"] for f in db.get_fournisseurs()}, key=str.lower)
+        except Exception:
+            noms = []
+        ttk.Combobox(row, textvariable=self.fournisseur_defaut_var, values=noms,
+                     width=34).pack(side="left", padx=6)
+        tk.Label(row, text="(laisser vide : aucun lien)", bg=C["bg"],
+                 fg=C["text_muted"], font=("Arial", 8)).pack(side="left")
+    WINDOW_TITLE  = "Importer des références produits depuis un CSV"
+    HEADER_TEXT   = "📥 Import des références produits (achats)"
+    FILE_TITLE    = "Sélectionner le fichier CSV des références"
+    ALIASES_MAP   = csv_importer.PIECES_MAPPING
+    OPTION_LABEL  = ("Références déjà en base : compléter seulement les champs vides "
+                     "(décocher pour les mettre à jour avec les valeurs du fichier)")
+    OPTION_DEFAULT = 1
+
+    def _validate_mapping(self, mapping):
+        if mapping.get("reference") is None:
+            return "Vous devez affecter une colonne à la Référence produit."
+        if (mapping.get("ref_fournisseur") is not None and mapping.get("fournisseur") is None
+                and not self.fournisseur_defaut_var.get().strip()):
+            return ("Une colonne « Réf. chez le fournisseur » est affectée : indiquez aussi "
+                    "la colonne Fournisseur ou le fournisseur du fichier.")
+        return None
+
+    def _confirm_text(self):
+        mode = ("complétées (champs vides uniquement)" if self.skip_empty_var.get()
+                else "MISES À JOUR avec les valeurs du fichier")
+        return (f"Importer {self.total_lines} ligne(s) dans le catalogue ?\n\n"
+                f"Les références déjà en base seront {mode}.")
+
+    def _run_rows(self, mapping, dry_run, progress_cb):
+        return csv_importer.import_pieces_rows(
+            self.csv_path, mapping, self.delimiter, self.encoding,
+            skip_doublons=bool(self.skip_empty_var.get()),
+            dry_run=dry_run, progress_cb=progress_cb,
+            fournisseur_defaut=self.fournisseur_defaut_var.get().strip())
+
+    def _import_failed(self, stats):
+        ecrits = stats["importees"] + stats["mises_a_jour"] + stats["completees"]
+        return stats["lignes_total"] > 0 and ecrits == 0 and bool(stats["erreurs"])
+
+    def _stats_rows(self, stats):
+        rows = [
+            ("Lignes lues",                 stats["lignes_total"]),
+            ("Lignes sans référence",       stats["lignes_ignorees"]),
+            ("Nouvelles références",        stats["importees"]),
+        ]
+        if self.skip_empty_var.get():
+            rows += [("Déjà en base (inchangées)", stats["ignorees"] - stats["completees"]),
+                     ("Déjà en base (complétées)", stats["completees"])]
+        else:
+            rows += [("Mises à jour",              stats["mises_a_jour"])]
+        rows.append(("Erreurs", len(stats["erreurs"])))
+        return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RÉFÉRENCES PRODUITS (catalogue `pieces` utilisé par les achats de l'app Affaire)
+# ══════════════════════════════════════════════════════════════════════════════
+class ReferencesFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C["bg"])
+        self.app = app
+        mk_header(self, "Références produits",
+                  "   Catalogue proposé dans les bons de commande et intentions d'achat")
+
+        sf = tk.Frame(self, bg=C["bg"])
+        sf.pack(fill="x", padx=20, pady=8)
+        tk.Label(sf, text="🔍 Recherche :", bg=C["bg"], font=("Arial",10)).pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._schedule_refresh())
+        ttk.Entry(sf, textvariable=self.search_var, width=30).pack(side="left", padx=4)
+        tk.Label(sf, text="Fournisseur :", bg=C["bg"], font=("Arial",10)).pack(side="left", padx=(12, 0))
+        self.fournisseur_var = tk.StringVar(value=self.TOUS)
+        self.fournisseur_cb = ttk.Combobox(sf, textvariable=self.fournisseur_var,
+                                           values=[self.TOUS], width=26, state="readonly")
+        self.fournisseur_cb.pack(side="left", padx=4)
+        self.fournisseur_cb.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+        self.count_lbl = tk.Label(sf, text="", bg=C["bg"], fg=C["text_muted"], font=F["small"])
+        self.count_lbl.pack(side="left", padx=10)
+        mk_btn(sf, "📥 Importer CSV",
+               lambda: ImportPiecesCSVDialog(self, self.app, on_save=self.refresh),
+               color=C["btn2"]).pack(side="right")
+
+        cols = ("reference", "libelle", "marque", "fournisseurs", "prix_achat", "prix_vente")
+        col_defs = [("reference", "Référence", 160), ("libelle", "Désignation", 290),
+                    ("marque", "Marque", 110), ("fournisseurs", "Fournisseur(s)", 200),
+                    ("prix_achat", "Prix d'achat HT", 105, "e"),
+                    ("prix_vente", "Prix de vente HT", 105, "e")]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=22)
+        tf.pack(fill="both", expand=True, padx=20, pady=4)
+
+        af = tk.Frame(self, bg=C["bg"])
+        af.pack(fill="x", padx=20, pady=8)
+        mk_btn(af, "🏭 Fournisseurs de la référence…", self._fournisseurs).pack(side="left", padx=4)
+        mk_btn(af, "🗑️ Supprimer", self._supprimer, color=C["danger"]).pack(side="left", padx=4)
+        self.tree.bind("<Double-1>", lambda e: self._fournisseurs())
+        tk.Label(af, text="Affichage limité aux 500 premières références : "
+                          "utilisez la recherche pour en trouver une.",
+                 bg=C["bg"], fg=C["text_muted"], font=F["small"]).pack(side="left", padx=12)
+        self._cache = []
+        self._after_id = None
+
+    def _schedule_refresh(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+        self._after_id = self.after(300, self.refresh)
+
+    @staticmethod
+    def _fmt(v):
+        try:
+            return f"{float(v or 0):,.2f} €".replace(",", " ").replace(".", ",") if v else ""
+        except (TypeError, ValueError):
+            return ""
+
+    TOUS = "(tous)"
+
+    def filtrer_fournisseur(self, nom):
+        """Affiche uniquement les références de ce fournisseur (depuis l'onglet Fournisseurs)."""
+        self.search_var.set("")
+        self.fournisseur_var.set(nom or self.TOUS)
+        self.refresh()
+
+    def _refresh_fournisseurs_cb(self):
+        try:
+            noms = sorted({f["nom"] for f in db.get_fournisseurs() if f.get("nb_references")},
+                          key=str.lower)
+        except Exception:
+            noms = []
+        cur = self.fournisseur_var.get()
+        if cur != self.TOUS and cur not in noms:
+            noms.append(cur)
+        self.fournisseur_cb.config(values=[self.TOUS] + noms)
+
+    def refresh(self):
+        self._after_id = None
+        self._refresh_fournisseurs_cb()
+        nom_f = self.fournisseur_var.get()
+        nom_f = "" if nom_f == self.TOUS else nom_f
+        self._cache = list(db.get_pieces(search=self.search_var.get().strip(), limit=500,
+                                         fournisseur=nom_f, only_fournisseur=bool(nom_f)))
+
+        def _fourn(p):
+            return ", ".join(l["nom"] for l in p.get("fournisseurs") or [])
+
+        def _pa(p):   # prix du fournisseur filtré s'il est connu
+            return p.get("prix_fournisseur") or p.get("prix_achat")
+        fill_tree(self.tree, [(p["reference"], p.get("libelle", ""), p.get("marque", ""),
+                               _fourn(p), self._fmt(_pa(p)), self._fmt(p.get("prix_vente")))
+                              for p in self._cache])
+        try:
+            total = db.count_pieces()
+            self.count_lbl.config(text=f"{total} référence(s) au catalogue")
+        except Exception:
+            self.count_lbl.config(text="")
+
+    def _fournisseurs(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez une référence."); return
+        PieceFournisseursDialog(self, self._cache[int(sel[0])], on_save=self.refresh)
+
+    def _supprimer(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez une référence."); return
+        p = self._cache[int(sel[0])]
+        if messagebox.askyesno("Supprimer", f"Supprimer la référence '{p['reference']}' du catalogue ?\n\n"
+                               "Les bons de commande existants ne sont pas modifiés."):
+            db.delete_piece(p["id"]); self.refresh()
+
+
+class PieceFournisseursDialog(tk.Toplevel):
+    """Fournisseurs d'une référence produit : référence chez le fournisseur,
+    dernier prix d'achat, date du dernier achat (renseignée par les BC / IA)."""
+
+    def __init__(self, parent, piece, on_save=None):
+        super().__init__(parent)
+        self.piece = piece; self.on_save = on_save
+        self.title(f"Fournisseurs – {piece['reference']}")
+        self.configure(bg=C["bg"])
+        self.geometry("720x460")
+        self.grab_set()
+        tk.Label(self, text=f"{piece['reference']}  {piece.get('libelle') or ''}",
+                 bg=C["bg"], font=F["h2"], fg=C["header"]).pack(anchor="w", padx=16, pady=(12, 2))
+        tk.Label(self, text="Les liens sont aussi créés automatiquement à l'enregistrement "
+                            "d'un bon de commande ou d'une intention d'achat.",
+                 bg=C["bg"], fg=C["text_muted"], font=F["small"]).pack(anchor="w", padx=16)
+
+        cols = ("nom", "ref", "prix", "date")
+        col_defs = [("nom", "Fournisseur", 220), ("ref", "Réf. chez le fournisseur", 170),
+                    ("prix", "Prix d'achat HT", 110, "e"), ("date", "Dernier achat", 100, "center")]
+        tf, self.tree = mk_tree(self, cols, col_defs, height=8)
+        tf.pack(fill="both", expand=True, padx=16, pady=8)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+
+        ff = tk.Frame(self, bg=C["bg"]); ff.pack(fill="x", padx=16)
+        try:
+            noms = sorted({f["nom"] for f in db.get_fournisseurs()}, key=str.lower)
+        except Exception:
+            noms = []
+        self.v_nom = tk.StringVar(); self.v_ref = tk.StringVar(); self.v_prix = tk.StringVar()
+        for i, (lbl, w) in enumerate((("Fournisseur", None), ("Réf. fournisseur", None),
+                                      ("Prix d'achat HT", None))):
+            tk.Label(ff, text=lbl, bg=C["bg"], font=("Arial", 9)).grid(row=0, column=i, sticky="w", padx=4)
+        ttk.Combobox(ff, textvariable=self.v_nom, values=noms, width=28).grid(row=1, column=0, padx=4)
+        ttk.Entry(ff, textvariable=self.v_ref, width=22).grid(row=1, column=1, padx=4)
+        ttk.Entry(ff, textvariable=self.v_prix, width=12).grid(row=1, column=2, padx=4)
+        mk_btn(ff, "💾 Enregistrer le lien", self._save).grid(row=1, column=3, padx=6)
+
+        bf = tk.Frame(self, bg=C["bg"]); bf.pack(fill="x", padx=16, pady=10)
+        mk_btn(bf, "🗑️ Retirer ce fournisseur", self._remove, color=C["danger"]).pack(side="left")
+        mk_btn(bf, "Fermer", self.destroy, color="#888").pack(side="right")
+        self._liens = []
+        self._load()
+
+    def _load(self):
+        self._liens = list(db.get_piece_fournisseurs(self.piece["id"]))
+        fill_tree(self.tree, [(l["nom"], l["ref_fournisseur"],
+                               ReferencesFrame._fmt(l["prix_achat"]), l["date_dernier_achat"])
+                              for l in self._liens])
+
+    def _on_select(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        l = self._liens[int(sel[0])]
+        self.v_nom.set(l["nom"]); self.v_ref.set(l["ref_fournisseur"])
+        self.v_prix.set(f"{l['prix_achat']:g}".replace(".", ",") if l["prix_achat"] else "")
+
+    def _save(self):
+        nom = self.v_nom.get().strip()
+        if not nom:
+            messagebox.showwarning("Champ requis", "Indiquez le fournisseur.", parent=self); return
+        prix = csv_importer.parse_prix(self.v_prix.get())
+        try:
+            db.set_piece_fournisseur(self.piece["id"], nom, self.v_ref.get().strip(), prix)
+        except db.APIError as e:
+            messagebox.showerror("Enregistrement impossible", str(e), parent=self); return
+        self.v_nom.set(""); self.v_ref.set(""); self.v_prix.set("")
+        self._load()
+        if self.on_save:
+            self.on_save()
+
+    def _remove(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un fournisseur.", parent=self); return
+        l = self._liens[int(sel[0])]
+        if not messagebox.askyesno("Retirer", f"Retirer le lien avec « {l['nom']} » ?", parent=self):
+            return
+        db.delete_piece_fournisseur(self.piece["id"], l["fournisseur_id"])
+        self._load()
+        if self.on_save:
+            self.on_save()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
