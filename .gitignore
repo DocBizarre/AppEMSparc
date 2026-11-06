@@ -18,3 +18,6 @@ dist/
 *.swp
 Thumbs.db
 .DS_Store
+
+# Base locale (données runtime, jamais versionnée)
+data/ems.db
